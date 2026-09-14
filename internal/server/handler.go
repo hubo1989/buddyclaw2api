@@ -2,6 +2,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/autoclaw"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
@@ -31,12 +34,31 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429 冷却，默认 60s
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// Autoclaw 可选上游（nil = 未启用，零开销）。
+	Autoclaw *autoclaw.Subsystem
+
+	// EnableAdmin 开放 /admin/autoclaw/* 管理端点（需 Autoclaw 非 nil 且鉴权沿用 APIKey）。
+	EnableAdmin bool
+	// AdminAuthDir / AdminHost：管理端点需要的 autoclaw 目录与 API host（空取默认）。
+	AdminAuthDir string
+	AdminHost    string
+	// AdminPanelURL 账号管理页地址（need_captcha 引导用；空取默认 10100 面板页）。
+	AdminPanelURL string
 }
 
 // Handler 主路由。
 type Handler struct {
 	cfg Config
 	mux *http.ServeMux
+	// apiKeyHash 是 cfg.APIKey 的 SHA-256 摘要（仅当 APIKey 非空时有意义）。
+	// 用定长摘要做常量时间比较：既消除 `!=` 的逐字节时序侧信道，
+	// 也避免直接比较原文时因长度不同而提前返回（长度也会泄露）。
+	apiKeyHash [sha256.Size]byte
+
+	// adminDeps / adminClient：管理端点依赖（RegisterAdminRoutes 填充）。
+	adminDeps   AdminDeps
+	adminClient *autoclaw.Client
 }
 
 // NewHandler 构建 handler。
@@ -51,10 +73,27 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	if cfg.APIKey != "" {
+		h.apiKeyHash = sha256.Sum256([]byte(cfg.APIKey))
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// 带外 token 转发（opencodex 内置 provider 专用）：调用方自带 AutoClaw access token，
+	// 由这里按 token 自动选国内/国际 host —— opencodex 只有一个 baseUrl 做不到这件事。
+	// 不校验本服务 APIKey（调用方带的是上游账号 token），仅回环使用。
+	if cfg.Autoclaw != nil {
+		h.mux.HandleFunc("POST /v1/autoclaw/chat/completions", h.autoclawPassthrough)
+	}
+	if cfg.EnableAdmin && cfg.Autoclaw != nil {
+		h.RegisterAdminRoutes(AdminDeps{
+			Autoclaw: cfg.Autoclaw,
+			AuthDir:  cfg.AdminAuthDir,
+			Host:     cfg.AdminHost,
+			PanelURL: cfg.AdminPanelURL,
+		})
+	}
 	return h
 }
 
@@ -65,8 +104,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.APIKey != "" {
+			const prefix = "Bearer "
 			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") || strings.TrimPrefix(authz, "Bearer ") != h.cfg.APIKey {
+			// 先用常量时间比较摘要再决定放行：不要用 `!=` 比原文（时序侧信道可逐字节爆破）。
+			// 摘要定长，ConstantTimeCompare 仅在长度相等时比较，长度维度也不泄露。
+			sum := sha256.Sum256([]byte(strings.TrimPrefix(authz, prefix)))
+			if !strings.HasPrefix(authz, prefix) || subtle.ConstantTimeCompare(sum[:], h.apiKeyHash[:]) != 1 {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}
@@ -105,7 +148,27 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"in_flight_full":  inFlightFull,
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		"autoclaw":        h.autoclawStatus(),
 	})
+}
+
+// autoclawStatus autoclaw 上游观测（未启用时返回 enabled:false）。
+func (h *Handler) autoclawStatus() map[string]any {
+	if h.cfg.Autoclaw == nil {
+		return map[string]any{"enabled": false}
+	}
+	return h.cfg.Autoclaw.Status()
+}
+
+// isBareAutoclawModel 识别不带 autoclaw/ 前缀的 AutoClaw 路由模型
+// （provider 前缀 zai_/zaicoding_/tdpsk_ 为 AutoClaw 独有，与 workbuddy 模型名不冲突）。
+func isBareAutoclawModel(m string) bool {
+	for _, p := range []string{"zai_", "zaicoding_", "tdpsk_"} {
+		if strings.HasPrefix(m, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
@@ -145,8 +208,8 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 func (h *Handler) modelList() []map[string]any {
+	out := make([]map[string]any, 0)
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
 			entry := map[string]any{
 				"id":                mi.ID,
@@ -161,6 +224,12 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			out = append(out, entry)
 		}
+	}
+	// autoclaw 模型追加在后（带 autoclaw/ 前缀，命名空间隔离）
+	if h.cfg.Autoclaw != nil {
+		out = append(out, h.cfg.Autoclaw.ModelList()...)
+	}
+	if len(out) > 0 {
 		return out
 	}
 	return staticModels
@@ -213,6 +282,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream bool `json:"stream"`
 	}
 	_ = json.Unmarshal(body, &peek)
+
+	// autoclaw 前缀路由：autoclaw/xxx 由独立上游处理，与 workbuddy 池完全隔离。
+	// 另接受裸路由模型（zai_*/zaicoding_*/tdpsk_* 前缀是 AutoClaw 独有命名空间，
+	// 不会与 workbuddy 模型冲突）——供 opencodex 以独立 provider 名接入时使用。
+	if h.cfg.Autoclaw != nil {
+		var probe struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &probe)
+		if m := probe.Model; strings.HasPrefix(m, "autoclaw/") || isBareAutoclawModel(m) {
+			h.cfg.Autoclaw.Chat(w, body, peek.Stream)
+			return
+		}
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -415,4 +498,39 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// autoclawPassthrough 用调用方自带的 access token 转发对话到 AutoClaw 上游。
+//
+// 为什么需要它：opencodex 的内置 provider 只有一个 baseUrl，而 AutoClaw 的 token 与 host 绑定
+// （手机号账号在国内 host、z.ai/Google 账号在国际 host）。让 provider 指向本端点，
+// host 选择就集中在这里完成。
+func (h *Handler) autoclawPassthrough(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Autoclaw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{"message": "autoclaw 未启用", "type": "service_unavailable"},
+		})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": "读取请求体失败: " + err.Error(), "type": "invalid_request_error"},
+		})
+		return
+	}
+	token := strings.TrimSpace(r.Header.Get("X-Authorization"))
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("Authorization"))
+	}
+	// 反复剥离 "Bearer " 前缀：opencodex 的 adapter 会自己拼一次 Bearer，
+	// 而凭据存储里的 access 可能已经带了前缀 → 会出现 "Bearer Bearer <jwt>"。
+	for len(token) > 7 && strings.EqualFold(token[:7], "bearer ") {
+		token = strings.TrimSpace(token[7:])
+	}
+	var peek struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &peek)
+	h.cfg.Autoclaw.ChatWithToken(w, body, token, peek.Stream)
 }

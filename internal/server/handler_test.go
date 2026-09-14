@@ -330,8 +330,9 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	if st.Until.Hour() != 4 {
 		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
 	}
-	if d := time.Until(st.Until); d <= 0 || d > 24*time.Hour {
-		t.Errorf("until %v not within (0,24h]: %v", st.Until, d)
+	// 时长 = 28h - 当前时刻，范围 (4h, 28h]（本地 00:00~04:00 之间必然 >24h）。
+	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
+		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
 	}
 	// 立即换号成功：good 被选中。
 	stGood, _ := p.Status("good")
@@ -654,6 +655,38 @@ func TestAPIKeyAuth(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Errorf("right key: code=%d", rec.Code)
+	}
+}
+
+func TestAPIKeyAuthConstantTimeEdgeCases(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+	})
+	cases := []struct {
+		authz string
+		want  int
+	}{
+		{"", 401},               // 完全没带 header
+		{"secret", 401},         // 缺 "Bearer " 前缀
+		{"Bearer", 401},         // 前缀不完整
+		{"Bearer ", 401},        // 空 token
+		{"Bearer secre", 401},   // 前缀匹配但长度不足
+		{"Bearer secretX", 401}, // 多一字节
+		{"bearer secret", 401},  // 前缀大小写敏感
+		{"Bearer secret", 200},  // 正确
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		if tc.authz != "" {
+			req.Header.Set("Authorization", tc.authz)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("authz=%q: code=%d want %d", tc.authz, rec.Code, tc.want)
+		}
 	}
 }
 
