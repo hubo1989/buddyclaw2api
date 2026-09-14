@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/autoclaw"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -26,14 +28,21 @@ func main() {
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
-		// 配置文件不存在时给一次机会用纯默认 + env
-		if os.IsNotExist(err) {
+		// 配置文件不存在时给一次机会用纯默认 + env。
+		// 必须用 errors.Is 解包——Load 内部用 %w 包装了 os 错误，
+		// os.IsNotExist 不解包，会让本分支永远不成立（死代码）。
+		if errors.Is(err, os.ErrNotExist) {
 			log.Printf("config %s not found, using defaults+env", *cfgPath)
 			cfg, err = Load("")
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
+	}
+
+	// 安全闸门：空 key + 非回环监听直接拒绝启动，避免无鉴权暴露。
+	if err := cfg.ValidateForServe(); err != nil {
+		log.Fatalf("unsafe config: %v", err)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir, cfg.Region)
@@ -80,6 +89,39 @@ func main() {
 		return 0
 	}
 
+	// autoclaw 上游（默认关闭；启用时从 auth 目录加载 autoclaw-*.json）。
+	var acSub *autoclaw.Subsystem
+	adminAuthDir := ""
+	if cfg.Autoclaw.Enabled {
+		acDir := cfg.Autoclaw.AuthDir
+		if acDir == "" {
+			acDir = cfg.AuthDir
+		}
+		adminAuthDir = acDir
+		acCreds, err := autoclaw.LoadDir(acDir)
+		if err != nil {
+			log.Fatalf("load autoclaw auths: %v", err)
+		}
+		if len(acCreds) == 0 {
+			log.Printf("WARN: autoclaw.enabled 但 %s 下无 autoclaw-*.json — "+
+				"先运行 wb2api-autoclaw-login -phone <手机号> 登录（账号须服务独占，勿与桌面端同号）", acDir)
+		} else {
+			for _, c := range acCreds {
+				log.Printf("autoclaw account: uid=%s phone=%s", c.UID, autoclaw.MaskPhoneExport(c.Phone))
+			}
+		}
+		acSub = autoclaw.NewSubsystem(autoclaw.SubsystemConfig{
+			Host:             cfg.Autoclaw.Host,
+			Timeout:          time.Duration(cfg.Autoclaw.TimeoutSeconds) * time.Second,
+			RefreshSkew:      cfg.AutoclawRefreshSkew,
+			SoftCooldown:     cfg.AutoclawSoftDur,
+			BreakerThreshold: cfg.Autoclaw.BreakerThreshold,
+			BreakerCooldown:  cfg.AutoclawBreakerDur,
+			BreakerMax:       cfg.AutoclawBreakerMax,
+		}, acCreds)
+		log.Printf("autoclaw upstream enabled: %d account(s)", acSub.Count())
+	}
+
 	up := upstream.New()
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
@@ -89,16 +131,22 @@ func main() {
 		Upstream:       up,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		Autoclaw:       acSub,
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
+		Pool:          p,
+		Upstream:      up,
+		APIKey:        cfg.APIKey,
+		Session:       sessRouter,
+		StickyCount:   sessCount,
+		RedisMode:     redisMode,
+		SoftCooldown:  cfg.SoftRateDur,
+		Autoclaw:      acSub,
+		EnableAdmin:   acSub != nil,
+		AdminAuthDir:  adminAuthDir,
+		AdminHost:     cfg.Autoclaw.Host,
+		AdminPanelURL: os.Getenv("WB2A_ADMIN_PANEL_URL"),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

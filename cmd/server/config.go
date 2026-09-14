@@ -4,6 +4,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -59,12 +61,29 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	Autoclaw struct {
+		Enabled            bool   `json:"enabled"`              // 默认 false，零影响
+		Host               string `json:"host"`                 // 默认官方生产 host
+		AuthDir            string `json:"auth_dir"`             // 默认同顶层 auth_dir（autoclaw-*.json）
+		TimeoutSeconds     int    `json:"timeout_seconds"`      // 上游 HTTP 超时，默认 120
+		RefreshSkew        string `json:"refresh_skew"`         // token 提前刷新窗口，默认 "30m"
+		SoftRate           string `json:"soft_rate"`            // 429 冷却，默认 "60s"
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败熔断阈值，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 熔断基础时长，默认 "1m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 熔断封顶，默认 "30m"
+		DefaultModel       string `json:"default_model"`        // 预留：默认路由模型
+	} `json:"autoclaw"`
+
 	// 解析后
 	SoftRateDur         time.Duration `json:"-"`
 	BreakerCooldownDur  time.Duration `json:"-"`
 	BreakerCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
+	AutoclawRefreshSkew time.Duration `json:"-"`
+	AutoclawSoftDur     time.Duration `json:"-"`
+	AutoclawBreakerDur  time.Duration `json:"-"`
+	AutoclawBreakerMax  time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -90,6 +109,13 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	c.Autoclaw.Host = ""
+	c.Autoclaw.TimeoutSeconds = 120
+	c.Autoclaw.RefreshSkew = "30m"
+	c.Autoclaw.SoftRate = "60s"
+	c.Autoclaw.BreakerThreshold = 3
+	c.Autoclaw.BreakerCooldown = "1m"
+	c.Autoclaw.BreakerCooldownMax = "30m"
 	return c
 }
 
@@ -141,6 +167,17 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_AUTOCLAW_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Autoclaw.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_AUTOCLAW_HOST"); v != "" {
+		c.Autoclaw.Host = v
+	}
+	if v := os.Getenv("WB2A_AUTOCLAW_AUTH_DIR"); v != "" {
+		c.Autoclaw.AuthDir = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -182,5 +219,110 @@ func (c *Config) normalize() error {
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
+	// autoclaw 时长字段（enabled=false 也解析，配置错误尽早暴露）
+	if c.AutoclawRefreshSkew, err = c.durOr(c.Autoclaw.RefreshSkew, "30m", "autoclaw.refresh_skew"); err != nil {
+		return err
+	}
+	if c.AutoclawSoftDur, err = c.durOr(c.Autoclaw.SoftRate, "60s", "autoclaw.soft_rate"); err != nil {
+		return err
+	}
+	if c.AutoclawBreakerDur, err = c.durOr(c.Autoclaw.BreakerCooldown, "1m", "autoclaw.breaker_cooldown"); err != nil {
+		return err
+	}
+	if c.AutoclawBreakerMax, err = c.durOr(c.Autoclaw.BreakerCooldownMax, "30m", "autoclaw.breaker_cooldown_max"); err != nil {
+		return err
+	}
+	if c.Autoclaw.BreakerThreshold <= 0 {
+		c.Autoclaw.BreakerThreshold = 3
+	}
+	if c.Autoclaw.TimeoutSeconds <= 0 {
+		c.Autoclaw.TimeoutSeconds = 120
+	}
 	return nil
+}
+
+// durOr 解析 duration 字符串，空值取 def，非法值返回带字段名的错误。
+func (c *Config) durOr(v, def, field string) (time.Duration, error) {
+	if v == "" {
+		v = def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	return d, nil
+}
+
+// placeholderAPIKeys 是 config.example.json / README 样例里出现的示例占位值。
+// 用户 `cp config.example.json config.json` 后忘记修改，就会拿到一个"非空但众所周知"
+// 的 key —— 那等于把鉴权做成摆设，还会绕过下方的空 key 检查。因此一律视同未设置。
+var placeholderAPIKeys = map[string]bool{
+	"your-api-key-here": true,
+	"your-api-key":      true,
+	"changeme":          true,
+	"change-me":         true,
+}
+
+// ValidateForServe 是"即将监听端口"之前的安全闸门，与 Load/normalize 的纯解析职责分离。
+//
+// 不变量：APIKey == ""（或等于示例占位值）等价于完全不做鉴权。此时若监听地址不是回环，
+// 则任何网络可达者都能：
+//   - 调用 /v1/chat/completions 白嫖并烧掉账号积分；
+//   - 读取 /status 拿到全部账号的 uid / 昵称 / 积分 / 错误原因。
+//
+// 因此：空 key + 非回环监听 = 拒绝启动（fail closed）。回环监听只告警（本机自用是合理场景）。
+// 若确需在非回环地址上裸跑（例如前面挂了自带鉴权的反向代理），必须显式设置
+// WB2A_ALLOW_INSECURE_LISTEN=1 才降级为醒目告警。
+func (c *Config) ValidateForServe() error {
+	if !c.hasUsableAPIKey() {
+		if isLoopbackListen(c.Listen) {
+			log.Printf("WARN: api_key 为空或仍是示例占位值 — /v1/* 与 /status 形同不鉴权（listen=%s 仅回环可达，风险可控）", c.Listen)
+			return nil
+		}
+		if envTruthy(os.Getenv("WB2A_ALLOW_INSECURE_LISTEN")) {
+			log.Printf("WARN: api_key 为空或仍是示例占位值，且 listen=%s 非回环 — 服务对网络基本开放；"+
+				"已检测到 WB2A_ALLOW_INSECURE_LISTEN，按显式授权继续启动", c.Listen)
+			return nil
+		}
+		return fmt.Errorf("拒绝启动：api_key 为空或仍是示例占位值（等于不鉴权），而 listen=%q 不是回环地址，会把 /v1/chat/completions 与 /status 暴露给任意网络可达者。"+
+			"请设置 config 的 api_key 或环境变量 WB2A_API_KEY；或改为监听 127.0.0.1；"+
+			"确需无鉴权监听时显式设置 WB2A_ALLOW_INSECURE_LISTEN=1", c.Listen)
+	}
+	return nil
+}
+
+// hasUsableAPIKey 判断 key 是否真的能起鉴权作用（非空且不是示例占位值）。
+func (c *Config) hasUsableAPIKey() bool {
+	k := strings.TrimSpace(c.APIKey)
+	if k == "" {
+		return false
+	}
+	return !placeholderAPIKeys[strings.ToLower(k)]
+}
+
+// isLoopbackListen 判断监听地址是否仅本机可达。
+// ":7863" / "0.0.0.0:7863" / "[::]:7863" 均表示全部网卡 → false。
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	// 空 host（如 ":7863"）表示绑定所有网卡，不是回环。
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func envTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

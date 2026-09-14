@@ -5,9 +5,9 @@
 //
 //	login url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
 //	              state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
-//	login poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
+//	login poll  → 读 state，轮询 GET /v2/plugin/auth/token?state= 直到登录完成（默认最长 5 分钟），
 //	              成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
-//	              stdout 打印完整 token+account JSON
+//	              stdout 打印完整 token+account JSON（进度写 stderr）
 //
 // 无 PKCE（workbuddy 设备流由服务端签发 state，与 qoderwork 不同）。
 package main
@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -93,9 +94,49 @@ type loginState struct {
 	State string `json:"state"`
 }
 
+// pollToken 轮询 auth/token 直到登录完成或超时。
+//
+// 为什么必须轮询：登录完成发生在浏览器侧，时机不可控。早先的实现只请求一次，
+// 于是"用户在浏览器点完授权"与"脚本发起 poll"之间只要有一点不同步（按 y 太早、
+// 网络往返、上游状态同步延迟），就会直接判定失败——实测中连续 4 个账号全部卡在
+// 这一步、一份凭证都没落盘，而事后补 poll 同一 state 却一次就成功。
+//
+// 每次尝试间隔 2s，默认最长 5 分钟；可用 LOGIN_POLL_TIMEOUT（秒）覆盖。
+// 进度只写 stderr，stdout 保持"仅最终 JSON"的契约不变。
+func pollToken(client *http.Client, state string) (json.RawMessage, error) {
+	timeout := 300 * time.Second
+	if v := os.Getenv("LOGIN_POLL_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			timeout = time.Duration(n) * time.Second
+		}
+	}
+	const interval = 2 * time.Second
+	start := time.Now()
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		tokRaw, _, err := doJSON(client, http.MethodGet, endpointAuthToken+state, nil, nil)
+		if err == nil {
+			return tokRaw, nil
+		}
+		lastErr = err
+		// pending 时上游返回业务 code 非 0（"login ing"），HTTP 可能是 200 或 4xx；
+		// 网络错误/5xx 也可能是瞬时的 —— 一律重试到超时，再由下面统一汇报。
+		if time.Since(start) >= timeout {
+			return nil, fmt.Errorf("等待登录超时（已等 %s，共尝试 %d 次），最后一次错误：%v\n"+
+				"  请在浏览器打开 ./login.sh 最新打印的那个链接完成登录后重跑", timeout, attempt, lastErr)
+		}
+		if attempt == 1 || attempt%5 == 0 {
+			fmt.Fprintf(os.Stderr, "  等待浏览器完成登录… %ds\n", int(time.Since(start).Seconds()))
+		}
+		time.Sleep(interval)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: login <url|poll>")
+		fatal("这是 login.sh 的底层工具，本身不保存账号。\n" +
+			"  要完成登录，请直接运行：./login.sh\n" +
+			"  （子命令：url 只取授权链接；poll 轮询换取 token —— 二者由 login.sh 编排，单独跑 url 不会有任何落盘）")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -120,6 +161,12 @@ func main() {
 			fatal("write state: %v", err)
 		}
 		fmt.Println(st.AuthURL)
+		// 单跑 `login url` 是最常见的误用：拿到链接就以为登录完成，实则没有任何落盘。
+		// login.sh 会设 WB2A_LOGIN_ORCHESTRATED=1 来抑制这句提示。
+		if os.Getenv("WB2A_LOGIN_ORCHESTRATED") == "" {
+			fmt.Fprintln(os.Stderr, "提示：`login url` 只负责取授权链接，不会保存账号。"+
+				"要完成登录并落盘凭证，请直接运行 ./login.sh")
+		}
 
 	case "poll":
 		raw, err := os.ReadFile(stateFile)
@@ -131,13 +178,11 @@ func main() {
 			fatal("parse state: %v", err)
 		}
 		// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
-		// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-		tokRaw, status, errTok := doJSON(client, http.MethodGet, endpointAuthToken+ls.State, nil, nil)
+		// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle。
+		// pollToken 会一直等到登录完成（详见该函数注释）。
+		tokRaw, errTok := pollToken(client, ls.State)
 		if errTok != nil {
-			if status == 0 || status >= 500 {
-				fatal("token endpoint error: %v", errTok)
-			}
-			fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+			fatal("%v", errTok)
 		}
 		var tok struct {
 			AccessToken  string `json:"accessToken"`
@@ -146,7 +191,7 @@ func main() {
 			Domain       string `json:"domain"`
 		}
 		if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-			fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+			fatal("token 响应里没有 accessToken（上游返回异常），请重跑 ./login.sh")
 		}
 		// login/account 拿 uid/nickname（带 Bearer）
 		var acct struct {
@@ -175,6 +220,6 @@ func main() {
 		os.Remove(stateFile)
 
 	default:
-		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
+		fatal("unknown subcommand %q（want url|poll）—— 完整登录请直接运行 ./login.sh", os.Args[1])
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"workbuddy2api/internal/autoclaw"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -18,6 +19,8 @@ type Config struct {
 	Upstream       *upstream.Client
 	CheckinHours   []int // 默认 [9, 21]
 	KeepaliveHours []int // 默认 [22]
+	// Autoclaw 可选上游（nil = 未启用）：签到任务对其账号同样生效。
+	Autoclaw *autoclaw.Subsystem
 }
 
 // Scheduler 调度器。
@@ -103,6 +106,21 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+	}
+	// autoclaw 上游签到（幂等，含积分余额刷新）。
+	if s.cfg.Autoclaw != nil {
+		for _, r := range s.cfg.Autoclaw.RunSignin() {
+			switch {
+			case r.Skipped:
+				log.Printf("autoclaw checkin %s: skipped (%s)", r.Phone, r.Error)
+			case r.OK && r.Already:
+				log.Printf("autoclaw checkin %s: already signed (balance=%d)", r.Phone, r.Balance)
+			case r.OK:
+				log.Printf("autoclaw checkin %s: +%d points (balance=%d)", r.Phone, r.Reward, r.Balance)
+			default:
+				log.Printf("autoclaw checkin %s: %s", r.Phone, r.Error)
+			}
+		}
 	}
 }
 
