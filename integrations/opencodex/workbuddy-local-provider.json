@@ -1,0 +1,25 @@
+{
+  "adapter": "openai-chat",
+  "baseUrl": "http://127.0.0.1:7863/v1",
+  "allowPrivateNetwork": true,
+  "keyOptional": true,
+  "defaultModel": "deepseek-v4.1-flash",
+  "models": [
+    "auto",
+    "hy4-preview",
+    "hy3",
+    "hy3-x",
+    "deepseek-v4.1-flash",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5v-turbo",
+    "kimi-k3-1",
+    "kimi-k2.7",
+    "kimi-k2.6",
+    "minimax-m3",
+    "deepseek-v4-pro"
+  ],
+  "liveModels": false
+}
