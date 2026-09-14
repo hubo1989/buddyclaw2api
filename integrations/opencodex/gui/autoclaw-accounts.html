@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoClaw 账号池</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b21; --line:#2a2e37; --text:#e6e8eb; --muted:#8b909a;
+          --accent:#e8622c; --ok:#3fb27f; --bad:#e05252; --warn:#d9962c; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         max-width:880px; margin:0 auto; padding:32px 20px; }
+  h1 { font-size:20px; margin-bottom:4px; display:flex; align-items:center; gap:10px; }
+  h1 .logo { font-size:24px; }
+  .sub { color:var(--muted); font-size:12.5px; margin-bottom:24px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:18px; }
+  .card h2 { font-size:15px; margin-bottom:12px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  input, select { background:var(--bg); border:1px solid var(--line); color:var(--text);
+                  border-radius:6px; padding:8px 12px; font-size:13px; outline:none; min-width:0; }
+  input:focus, select:focus { border-color:var(--accent); }
+  input[type=text] { flex:1; min-width:140px; }
+  button { background:var(--accent); color:#fff; border:none; border-radius:6px;
+           padding:8px 16px; font-size:13px; cursor:pointer; white-space:nowrap; }
+  button:hover { filter:brightness(1.1); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--muted); }
+  button.danger { background:transparent; border:1px solid var(--bad); color:var(--bad); padding:4px 10px; font-size:12px; }
+  .msg { margin-top:10px; font-size:13px; padding:8px 12px; border-radius:6px; display:none; }
+  .msg.ok { display:block; background:rgba(63,178,127,.12); color:var(--ok); }
+  .msg.bad { display:block; background:rgba(224,82,82,.12); color:var(--bad); }
+  .msg.warn { display:block; background:rgba(217,150,44,.12); color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:99px; font-size:11.5px; }
+  .pill.ok { background:rgba(63,178,127,.15); color:var(--ok); }
+  .pill.bad { background:rgba(224,82,82,.15); color:var(--bad); }
+  .pill.warn { background:rgba(217,150,44,.15); color:var(--warn); }
+  .hidden { display:none !important; }
+  .steps { color:var(--muted); font-size:12.5px; margin:8px 0 0; padding-left:18px; }
+  .token-row { margin-top:8px; }
+  a { color:var(--accent); }
+  code { background:var(--bg); padding:2px 6px; border-radius:4px; font-size:12px; }
+  #refreshBtn { margin-left:auto; }
+</style>
+</head>
+<body>
+<h1><span class="logo">🦞</span>AutoClaw 账号登录 <button id="refreshBtn" class="ghost" onclick="loadAccounts()">刷新</button></h1>
+<div class="sub">智谱 AutoClaw（澳龙）· 凭据加入 opencodex 账号池 · <span id="apiBaseLabel"></span></div>
+
+<!-- 账号列表 -->
+<div class="card">
+  <h2>已登录账号</h2>
+  <div class="sub" style="margin:-6px 0 12px">
+    这里是本页登录流程真正写入的池子 —— <code>opencodex</code> 的 autoclaw 账号（面板「提供方 → Autoclaw → 账户」看到的就是同一份）。
+  </div>
+  <table>
+    <thead><tr><th>账号</th><th>状态</th><th>积分</th><th>到期</th><th>来源</th><th></th></tr></thead>
+    <tbody id="acctBody"><tr><td colspan="6" style="color:var(--muted)">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<!-- 手机验证码登录 -->
+<!-- 方案 B：为 opencodex 面板登录的一站式流程（Google / Z.ai）。
+     本页与面板同源（都在 127.0.0.1:10100），可直接调面板登录 API：
+     /api/oauth/login → 启动守护进程 loginAutoclaw；/api/oauth/login/code → 喂输入；
+     凭据最终进 opencodex 账号池。滑块回执经 7863 的 captcha-param 中转。 -->
+<div class="card" id="ocxCard">
+  <h2>Google / Z.ai 登录</h2>
+  <div class="sub" style="margin-bottom:10px">
+    按编号做完即可，凭据直接进 opencodex 账号池。从 opencodex 面板点「Google / Z.ai 登录」也会跳到本区块。
+  </div>
+  <div class="row" style="margin-bottom:8px">
+    <select id="ocxVendor" style="min-width:120px">
+      <option value="google">Google</option>
+      <option value="zai">Z.ai</option>
+    </select>
+  </div>
+  <div class="row" style="margin-bottom:6px">
+    <span class="pill ok" style="flex:0 0 auto">1</span>
+    <span style="font-size:12.5px">点下方按钮，弹出验证窗后按提示完成（回执缓存 15 分钟）</span>
+    <button id="ocxCaptchaBtn" onclick="ocxRunCaptcha()">开始安全验证</button>
+  </div>
+  <div id="ocxCaptchaBox" class="hidden" style="margin:8px 0 10px 26px">
+    <div style="font-size:12.5px;color:var(--muted);margin-bottom:6px">安全验证进行中…</div>
+    <div id="ocxCaptchaEle"></div>
+  </div>
+  <div class="row" style="margin-bottom:6px">
+    <span class="pill ok" style="flex:0 0 auto">2</span>
+    <span style="font-size:12.5px">拖完滑块后，点这里启动登录（会自动打开授权页）</span>
+    <button id="ocxStartBtn" onclick="ocxStartLogin()" disabled>开始登录</button>
+  </div>
+  <div class="row" style="margin-bottom:6px">
+    <span class="pill ok" style="flex:0 0 auto">3</span>
+    <span style="font-size:12.5px">授权完成后，把浏览器地址栏的完整地址粘到这里</span>
+  </div>
+  <div class="row" style="margin-left:26px">
+    <input type="text" id="ocxCallback" placeholder="跳转地址（含 code=…）" style="flex:1 1 320px;max-width:520px">
+    <button id="ocxFinishBtn" onclick="ocxFinishLogin()" disabled>完成登录</button>
+  </div>
+  <div id="ocxMsg" class="msg"></div>
+  <div id="ocxErr" class="msg" style="color:#d9534f"></div>
+</div>
+
+
+<div class="sub" style="margin-top:8px">⚠️ 同一账号不要同时在 AutoClaw 桌面端登录（refresh token 轮换互踢）。</div>
+
+<script>
+// API 基址：默认同源 7863；面板部署在其他 host 时可改
+const DEFAULT_BASE = "http://127.0.0.1:7863";
+const base = localStorage.getItem("ac_api_base") || DEFAULT_BASE;
+document.getElementById("apiBaseLabel").textContent = base;
+
+function msg(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "msg " + (cls || "");
+}
+async function api(path, opts = {}) {
+  const r = await fetch(base + path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.ok === false) throw new Error(d.error || ("HTTP " + r.status));
+  return d;
+}
+async function loadAccounts() {
+  const body = document.getElementById("acctBody");
+  try {
+    // 读的是本页登录流程真正写入的池子：opencodex 的 autoclaw 账号。
+    // 老实现读 7863 的 /admin/autoclaw/accounts，而面板一站式登录走 no_persist、凭据只上交
+    // opencodex → 那张表恒为空，用户会以为「登录了却没账号」。
+    const res = await ocxApi("/api/oauth/accounts?provider=autoclaw", undefined, "GET");
+    if (!res.ok) throw new Error((res.body && res.body.error) || ("HTTP " + res.status));
+    const accounts = (res.body && res.body.accounts) || [];
+    if (accounts.length === 0) {
+      body.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">暂无账号 — 用下方任一方式添加</td></tr>';
+      return;
+    }
+    body.innerHTML = accounts.map(a => {
+      let pill = '<span class="pill ok">可用</span>';
+      if (a.active) pill = '<span class="pill ok">使用中</span>';
+      if (a.needsReauth) pill = '<span class="pill bad">需重新登录</span>';
+      const exp = a.expiresAt ? new Date(a.expiresAt).toLocaleString() : "–";
+      const q = a.quota && a.quota.customWindows && a.quota.customWindows[0]
+        ? a.quota.customWindows[0].label : (a.quotaUnavailable ? "暂不可用" : "–");
+      const label = a.alias || a.email || a.id;
+      return '<tr>' +
+        '<td>' + esc(label) + '<div style="color:var(--muted);font-size:12px">' + esc(a.id) + '</div></td>' +
+        '<td>' + pill + '</td>' +
+        '<td>' + esc(q) + '</td>' +
+        '<td style="color:var(--muted);font-size:12px">' + esc(exp) + '</td>' +
+        '<td style="color:var(--muted);font-size:12px">opencodex</td>' +
+        '<td><button class="danger" onclick="delAccount(\'' + esc(a.id) + '\')">删除</button></td>' +
+        '</tr>';
+    }).join("");
+  } catch (e) {
+    body.innerHTML = '<tr><td colspan="6"><span class="pill bad">无法读取 opencodex 账号池</span>' +
+      '<span style="color:var(--muted);font-size:12px"> — ' + esc(e.message || e) + '</span></td></tr>';
+  }
+}
+function esc(s) { const d = document.createElement("div"); d.textContent = String(s ?? ""); return d.innerHTML; }
+
+function loadCaptchaLib(cb) {
+  // 同源本地副本优先（外网 o.alicdn.com 慢或被广告插件拦时滑块会加载不出来）
+  if (window.initAliyunCaptcha || window.__acCaptchaLoading) return;
+  window.__acCaptchaLoading = true;
+  const onload = () => { window.__acCaptchaLoading = false; if (cb) cb(); };
+  const onerr = () => {
+    window.__acCaptchaLoading = false;
+    if (!window.__acCaptchaFallbackTried) {
+      window.__acCaptchaFallbackTried = true;   // 本地没有 → 回退外网 CDN
+      loadFrom("https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js", onload, onerr2 => {
+        window.__acCaptchaLoading = false;
+        if (cb) cb();
+      });
+    }
+  };
+  const loadFrom = (src, ok, fail) => {
+    // 官方做法：SDK 加载前设置 window.AliyunCaptchaConfig（region/prefix），SDK 内部从这里读；
+    // prefix/region 都不作为 init 参数传。region:"ga" 来自服务端 captcha-config。
+    window.AliyunCaptchaConfig = window.AliyunCaptchaConfig || { region: window.__acRegion || "ga", prefix: window.__acPrefix || "sq51tr" };
+    const s = document.createElement("script");
+    s.src = src;
+    s.async = true;
+    s.onload = ok;
+    s.onerror = fail;
+    document.head.appendChild(s);
+  };
+  loadFrom("/AliyunCaptcha.js", onload, onerr);
+}
+// 隐藏触发按钮：官方做法是 1px 固定定位的透明按钮，组件接管后由程序 click() 弹出验证窗。
+// ⚠️ 必须用**独立于可见按钮**的 id：若复用可见按钮的 id，本函数会直接返回那个可见按钮，
+// 而它在 ocxRunCaptcha() 里点击后就被 disable 了；对 disabled 按钮调 click() 不会触发
+// SDK 的弹出逻辑，弹窗永远不显示，最后只剩「滑块加载/验证超时」。
+var HIDDEN_TRIGGER_ID = "__acCaptchaHiddenTrigger";
+function ensureHiddenTrigger() {
+  let b = document.getElementById(HIDDEN_TRIGGER_ID);
+  if (!b) {
+    b = document.createElement("button");
+    b.id = HIDDEN_TRIGGER_ID;
+    b.type = "button";
+    b.tabIndex = -1;
+    b.setAttribute("aria-hidden", "true");
+    b.style.position = "fixed";
+    b.style.width = "1px";
+    b.style.height = "1px";
+    b.style.opacity = "0";
+    b.style.pointerEvents = "none";
+    b.style.overflow = "hidden";
+    document.body.appendChild(b);
+  }
+  return b;
+}
+// 阿里云 SDK 把回执作为 captchaVerifyCallback 的**首个参数本身**传出（2.0/V2 架构下是一段 JSON
+// 字符串，含 sceneId/certifyId/deviceToken/data；failover 路径还多一个 failover 字段），
+// 并不是 { captchaVerifyParam } 这种对象。老代码读 params.captchaVerifyParam 恒为 undefined，
+// 回执被丢成空串，上报后后端直接 400「body 需为 {vendor, captcha_verify_param}」。
+// 这里把三种可能形态都兜住，并原样透传。
+function captchaReceipt(params) {
+  if (typeof params === "string") return params;
+  if (params && typeof params.captchaVerifyParam === "string" && params.captchaVerifyParam) {
+    return params.captchaVerifyParam;
+  }
+  try { return JSON.stringify(params || {}); } catch (_) { return ""; }
+}
+function runCaptcha(cfg, boxId = "ocxCaptchaBox", eleId = "ocxCaptchaEle", msgId = "ocxMsg") {
+  return new Promise((resolve, reject) => {
+    const box = document.getElementById(boxId);
+    box.classList.remove("hidden");
+    msg(msgId, "正在加载安全验证…", "warn");
+    box.scrollIntoView({ behavior: "smooth", block: "center" });
+    // region/prefix 供 AliyunCaptchaConfig 使用（SDK 加载前设置）
+    window.__acRegion = cfg.region || "ga";
+    window.__acPrefix = cfg.prefix || "sq51tr";
+    // 等脚本就绪（本地/CDN 两级加载）
+    const t0 = Date.now();
+    (function pollLib() {
+      if (!window.initAliyunCaptcha) {
+        if (Date.now() - t0 > 15000) {
+          reject(new Error("滑块组件加载超时（本地与 CDN 均未就绪，检查网络/广告插件后重试）"));
+          return;
+        }
+        loadCaptchaLib(() => {});   // 加载失败后周期性重试
+        setTimeout(pollLib, 300);
+        return;
+      }
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error("滑块加载/验证超时，请重试")); }
+      }, 120000);
+      try {
+        // 完全对齐官方 init 参数：SceneId/mode:popup/element/button/callbacks/slideStyle/language。
+        // 不传 region/prefix（region 经 AliyunCaptchaConfig，prefix 经 SceneId 场景配置）。
+        // button 指向隐藏触发按钮（独立 id），可见按钮只负责调用本函数。
+        ensureHiddenTrigger();
+        window.initAliyunCaptcha({
+          SceneId: cfg.scene_id,
+          mode: "popup",
+          element: "#" + eleId,
+          button: "#" + HIDDEN_TRIGGER_ID,
+          captchaVerifyCallback: async (params) => {
+            settled = true;
+            clearTimeout(timer);
+            box.classList.add("hidden");
+            resolve(captchaReceipt(params));
+            return { captchaResult: true };
+          },
+          onBizResultCallback: () => {},
+          getInstance: (inst) => { window.__acCaptcha = inst; },
+          slideStyle: { width: 360, height: 40 },
+          language: "cn",   // 阿里白名单：cn/tw/en/ja/ko…（中文是 "cn"；"zh"/"zh-CN" 会卡「加载中」）
+          onError: (err) => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              reject(new Error("安全验证出错: " + (err?.message || JSON.stringify(err)).slice(0, 120)));
+            }
+          },
+        });
+        // 官方流程：init → warmup ≥2.1s → 程序化 click 隐藏按钮 → 组件弹出验证窗
+        setTimeout(() => {
+          ensureHiddenTrigger().click();
+        }, 2300);
+      } catch (e) {
+        clearTimeout(timer);
+        if (!settled) { settled = true; reject(new Error("滑块初始化失败: " + (e?.message || e))); }
+      }
+    })();
+  });
+}
+/* ===== 方案 B：为 opencodex 面板登录的一站式流程 ===== */
+// 本页与面板同源，直接调面板登录 API；凭据最终进 opencodex 账号池（守护进程独占 refresh）。
+const OCX_PANEL_BASE = location.origin.startsWith("http") && location.port === "10100"
+  ? location.origin : "http://127.0.0.1:10100";
+
+function ocxMsg(text, cls) {
+  const el = document.getElementById("ocxMsg");
+  el.textContent = text || "";
+  el.className = "msg " + (cls || "");
+}
+function ocxErr(text) {
+  // ⚠️ .msg 默认 display:none，只有带 .bad/.ok/.warn 才可见。老实现只写 textContent、
+  // 从不加类，导致所有报错都被 CSS 静默吞掉 —— 用户看到的就是「点了没反应」。
+  const el = document.getElementById("ocxErr");
+  el.textContent = text || "";
+  el.className = text ? "msg bad" : "msg";
+}
+
+/* ---------------- 步骤门禁 ----------------
+ * 第 2 步必须等安全验证回执就绪；第 3 步必须等授权页已经打开。
+ * 7863 的滑块回执是**按 vendor 缓存**的（putCaptcha(vendor,…)），所以门禁也按 vendor 记：
+ * 给 google 拖过滑块后切到 zai，回执并不通用，第 2 步要重新关闭。
+ */
+var ocxGate = {
+  captchaReady: {},   // vendor -> true（该 vendor 的滑块回执已就绪）
+  linkReady: {},      // vendor -> true（该 vendor 的授权链接已拿到并打开）
+  busy: { captcha: false, start: false, finish: false },
+};
+function ocxVendorNow() {
+  var s = document.getElementById("ocxVendor");
+  return s ? s.value : "google";
+}
+/** 按当前 vendor 重新计算两个按钮的可点状态（门禁 + 进行中）。 */
+function refreshOcxGate() {
+  var v = ocxVendorNow();
+  var start = document.getElementById("ocxStartBtn");
+  var finish = document.getElementById("ocxFinishBtn");
+  var cap = document.getElementById("ocxCaptchaBtn");
+  if (start) start.disabled = !ocxGate.captchaReady[v] || ocxGate.busy.start;
+  if (finish) finish.disabled = !ocxGate.linkReady[v] || ocxGate.busy.finish;
+  if (cap) cap.disabled = ocxGate.busy.captcha;
+  // 视觉上同步 disabled 态（浏览器默认样式对自定义按钮不总是够明显）
+  [[start, ocxGate.captchaReady[v]], [finish, ocxGate.linkReady[v]]].forEach(function (pair) {
+    if (!pair[0]) return;
+    pair[0].style.opacity = pair[1] ? "" : ".5";
+    pair[0].style.cursor = pair[1] ? "" : "not-allowed";
+  });
+}
+// 本脚本在 </body> 前执行，元素已就绪，直接绑定即可（不必等 DOMContentLoaded）。
+(function () {
+  var sel = document.getElementById("ocxVendor");
+  if (sel) sel.addEventListener("change", function () { refreshOcxGate(); });
+  refreshOcxGate();
+})();
+// 面板管理 API 需要 gui-session 凭据，两条通道按可用性自动选：
+//   1) 同源直连（首选）：GET /opencodex-session 会为 loopback 来源签发一份 origin 绑定的会话
+//      凭据（在返回 HTML 的 meta 标签里），本页与面板同源，可自行领取后直接调面板 API。
+//   2) postMessage 桥（回退）：仅当本页不是面板同源页、且 opener 仍在时使用。
+// 老实现只有第 2 条，而面板是 window.open(..., "noopener") / 弹层 iframe 打开本页 → opener
+// 必为空，于是第 2 步「开始登录」点了永远没反应（报错还被 CSS 吞掉，见 ocxErr）。
+let __ocxCred = null;   // { token, csrf }
+let __ocxReqSeq = 0;
+const __ocxPending = new Map();
+window.addEventListener("message", (ev) => {
+  if (ev.origin !== OCX_PANEL_BASE) return;
+  const d = ev.data || {};
+  if (d.type === "ocx-bridge-resp" && __ocxPending.has(d.seq)) {
+    const { resolve } = __ocxPending.get(d.seq);
+    __ocxPending.delete(d.seq);
+    resolve(d.res);
+  }
+});
+function ocxSameOrigin() {
+  try { return location.origin === OCX_PANEL_BASE && /^https?:$/.test(location.protocol); }
+  catch (_) { return false; }
+}
+/** 领取（并缓存）面板 loopback 会话凭据。 */
+async function ocxCreds() {
+  if (__ocxCred) return __ocxCred;
+  const res = await fetch("/opencodex-session", { method: "GET", credentials: "same-origin" });
+  if (!res.ok) throw new Error("无法领取面板会话凭据（HTTP " + res.status + "）");
+  const html = await res.text();
+  const pick = (n) => {
+    const m = html.match(new RegExp('name="' + n + '"[^>]*content="([^"]*)"'));
+    return m ? m[1] : "";
+  };
+  const token = pick("opencodex-session-token");
+  const csrf = pick("opencodex-session-csrf");
+  if (!token) throw new Error("面板会话凭据为空（/opencodex-session 未签发）");
+  __ocxCred = { token, csrf };
+  return __ocxCred;
+}
+async function ocxApi(path, body, method) {
+  const httpMethod = method || "POST";
+  if (ocxSameOrigin()) {
+    // 首选：同源自领凭据直连。凭据随会话过期，401 时丢缓存重领一次再试。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const cred = await ocxCreds();
+      const r = await fetch(path, {
+        method: httpMethod,
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          "x-opencodex-api-key": cred.token,
+          "x-opencodex-csrf-token": cred.csrf,
+          "x-opencodex-gui-origin": location.origin,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (r.status !== 401) {
+        const j = await r.json().catch(() => ({}));
+        return { ok: r.ok, status: r.status, body: j || {} };
+      }
+      __ocxCred = null;   // 会话过期 → 重领后重试
+    }
+    throw new Error("面板会话凭据失效（401）—— 请刷新面板页面后重试");
+  }
+  // 回退：postMessage 桥（本页非面板同源页时）
+  return new Promise((resolve, reject) => {
+    if (!window.opener || window.opener.closed) {
+      reject(new Error("本页既不是面板同源页，也没有面板 opener —— 请从面板点「Google / Z.ai 登录」或「AutoClaw 账号管理」进入。"));
+      return;
+    }
+    const seq = ++__ocxReqSeq;
+    __ocxPending.set(seq, { resolve });
+    window.opener.postMessage(
+      { type: "ocx-bridge-req", seq, path, body: body === undefined ? null : body },
+      OCX_PANEL_BASE,
+    );
+    setTimeout(() => {
+      if (__ocxPending.has(seq)) {
+        __ocxPending.delete(seq);
+        reject(new Error("面板响应超时（面板页可能已关闭或刷新）"));
+      }
+    }, 20000);
+  });
+}
+
+async function ocxRunCaptcha() {
+  const btn = document.getElementById("ocxCaptchaBtn");
+  ocxGate.busy.captcha = true; refreshOcxGate();
+  ocxErr("");
+  try {
+    const cfg = await api("/admin/autoclaw/login/captcha-config");
+    if (!cfg.enabled || !cfg.captcha) {
+      ocxGate.captchaReady[ocxVendorNow()] = true;
+      ocxMsg("服务端未开启滑块验证 — 可直接做第 2 步。", "ok");
+      return;
+    }
+    const param = await runCaptcha(cfg.captcha, "ocxCaptchaBox", "ocxCaptchaEle", "ocxMsg");
+    const d = await api("/admin/autoclaw/login/captcha-param", {
+      method: "POST",
+      body: JSON.stringify({ vendor: document.getElementById("ocxVendor").value, captcha_verify_param: param }),
+    });
+    // 回执已缓存到 7863 → 放行第 2 步（7863 按 vendor 缓存，门禁也按 vendor 记）
+    ocxGate.captchaReady[ocxVendorNow()] = true;
+    ocxMsg("✅ " + (d.message || "滑块回执已就绪") + " — 现在做第 2 步。", "ok");
+  } catch (e) {
+    ocxErr("滑块验证失败：" + e.message);
+  } finally {
+    ocxGate.busy.captcha = false; refreshOcxGate();
+  }
+}
+
+async function ocxStartLogin() {
+  const vendor = document.getElementById("ocxVendor").value;
+  // 步骤门禁：安全验证回执没就绪就不能开登录（回执缺失时上游必答 631002）。
+  if (!ocxGate.captchaReady[vendor]) {
+    ocxErr("请先完成第 1 步「开始安全验证」——" + vendor + " 的滑块回执就绪后才能开始登录。");
+    return;
+  }
+  ocxGate.busy.start = true; refreshOcxGate();
+  ocxErr("");
+  try {
+    // 取消可能挂着的旧流程，再启动新流程并把 vendor 喂给守护进程
+    await ocxApi("/api/oauth/login/cancel", { provider: "autoclaw" }).catch(() => ({}));
+    const s = await ocxApi("/api/oauth/login", { provider: "autoclaw", addAccount: true });
+    if (!s.ok) throw new Error((s.body && (s.body.error || s.body.message)) || "HTTP " + s.status);
+    const c = await ocxApi("/api/oauth/login/code", { provider: "autoclaw", input: vendor });
+    if (!c.ok) throw new Error((c.body && (c.body.error || c.body.message)) || "HTTP " + c.status);
+    ocxMsg("已启动 " + vendor + " 登录，正在等授权链接…", "ok");
+    ocxPollLink(vendor, 0);
+  } catch (e) {
+    ocxErr("启动失败：" + e.message);
+    ocxGate.busy.start = false; refreshOcxGate();
+  }
+}
+
+function ocxPollLink(vendor, tries) {
+  fetch(base + "/admin/autoclaw/login/oauth-link?vendor=" + encodeURIComponent(vendor))
+    .then(r => r.json())
+    .then(d => {
+      if (d && d.pending && d.url) {
+        ocxMsg("授权页已打开；完成后把跳转地址粘到第 3 步。", "ok");
+        window.open(d.url, "_blank");
+        // 授权页已打开 → 放行第 3 步（用户已可粘贴回跳地址）
+        ocxGate.linkReady[vendor] = true;
+        ocxGate.busy.start = false;
+        refreshOcxGate();
+      } else if (tries >= 6) {
+        ocxErr("等了 12 秒还没拿到授权链接 —— 多半是滑块回执缺失/过期：请重做第 1 步，再点第 2 步。");
+        // 链接没拿到 → 回执多半已过期，收回第 2 步的放行，强制重做第 1 步
+        ocxGate.captchaReady[vendor] = false;
+        ocxGate.busy.start = false;
+        refreshOcxGate();
+      } else {
+        setTimeout(() => ocxPollLink(vendor, tries + 1), 2000);
+      }
+    })
+    .catch(() => {
+      if (tries >= 6) {
+        ocxErr("联系 7863（" + base + "）失败，确认服务在跑。");
+        ocxGate.busy.start = false;
+        refreshOcxGate();
+      } else setTimeout(() => ocxPollLink(vendor, tries + 1), 2000);
+    });
+}
+
+async function ocxFinishLogin() {
+  const v = document.getElementById("ocxCallback").value.trim();
+  if (!v) { ocxErr("请先粘贴授权后浏览器跳转的完整地址。"); return; }
+  // 步骤门禁：授权页还没打开就不能提交（此时上游也没有待换的 code）。
+  if (!ocxGate.linkReady[ocxVendorNow()]) {
+    ocxErr("请先完成第 2 步「开始登录」——授权页打开后才能粘贴回跳地址完成登录。");
+    return;
+  }
+  ocxGate.busy.finish = true; refreshOcxGate();
+  ocxErr("");
+  try {
+    // 记下提交前的账号数：POST /api/oauth/login/code 只把输入投递给等待中的流程就立刻
+    // 回 {ok:true}，真正的上游换 token + 落盘在后台跑。凭据没写完就报「登录成功」，
+    // 面板/本页拉到的还是旧名册 —— 必须先等到「账号多了一个」再宣告成功。
+    const before = await ocxAccountCount();
+    const c = await ocxApi("/api/oauth/login/code", { provider: "autoclaw", input: v });
+    if (!c.ok) throw new Error((c.body && (c.body.error || c.body.message)) || "HTTP " + c.status);
+    ocxMsg("上游已受理，正在等待凭据写入账号池…", "warn");
+    await ocxWaitForNewAccount(before);
+    ocxMsg("✅ 登录成功，账号已加入 opencodex 账号池。可以关掉本页回到面板。", "ok");
+    notifyPanelAccountsChanged();
+    loadAccounts();   // 本页账号表立刻反映新账号，不必等 30 秒轮询
+    // 一轮流程走完 → 收回门禁，避免用旧回执/旧 code 重复提交
+    ocxGate.captchaReady = {};
+    ocxGate.linkReady = {};
+  } catch (e) {
+    ocxErr("完成登录失败：" + e.message);
+    // 失败可能是 code 无效或回执过期：收回第 3 步，让用户重新走第 2 步
+    ocxGate.linkReady[ocxVendorNow()] = false;
+  }
+  ocxGate.busy.finish = false;
+  refreshOcxGate();
+}
+
+/** 当前 opencodex 账号池里的 autoclaw 账号数（读取失败退化 0，仅作基线用）。 */
+async function ocxAccountCount() {
+  try {
+    const res = await ocxApi("/api/oauth/accounts?provider=autoclaw", undefined, "GET");
+    // -1 = 基线未知。若退化成 0，已有账号会让「数量变多」立刻成立，变成假成功。
+    return (res.ok && res.body && res.body.accounts) ? res.body.accounts.length : -1;
+  } catch (_) { return -1; }
+}
+
+/**
+ * 等账号池里真的多出账号。成功 = 数量超过基线；上游自己报错就立刻抛出；
+ * 记到 done 但仍没新账号，说明这一步并没有落地。超时给可操作的提示而不是空等。
+ */
+async function ocxWaitForNewAccount(before, timeoutMs = 90000) {
+  const known = typeof before === "number" && before >= 0;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const st = await ocxApi("/api/oauth/status?provider=autoclaw", undefined, "GET")
+      .then(r => (r.ok ? r.body : {}))
+      .catch(() => ({}));
+    if (st && st.error) throw new Error(String(st.error));
+    const n = (st && st.accounts ? st.accounts.length : 0);
+    if (known && n > before) return st;
+    // done 且没有 error = 这次登录已结算成功。同一身份重登是「原地更新」，账号数不变，
+    // 不能把「没变多」判成失败（与面板原生 loginOAuth 的 done===true 口径一致）。
+    if (st && st.done === true) return st;
+    if (Date.now() > deadline) throw new Error("等待上游确认超时（90 秒）——账号可能已加，请刷新本页或面板重看。");
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+// 通知面板页立刻重拉账号名册。
+// 面板只在「它自己的登录流程走完 / 切页签 / 窗口重新可见」时拉名册；本页驱动的登录面板不知道，
+// 不通知就要等用户手动切页签才看得到新账号。面板侧收到 ocx-accounts-changed 后派发
+// visibilitychange / focus 触发重拉（见 providers-autoclaw-panel.js）。
+// 本页在弹层 iframe 里时没有 opener，所以也要照顾 window.parent / window.top。
+function notifyPanelAccountsChanged() {
+  var msg = { type: "ocx-accounts-changed" };
+  // 主通道：BroadcastChannel（同源、跨标签页，不依赖 opener/iframe 引用）。
+  // 自建页常以 window.open(..., "noopener") 打开 → window.opener 为空，postMessage 到不了面板。
+  try {
+    var ch = new BroadcastChannel("ocx-autoclaw-accounts");
+    ch.postMessage(msg);
+    setTimeout(function () { try { ch.close(); } catch (_) {} }, 1000);
+  } catch (_) {}
+  var targets = [];
+  try { if (window.opener && !window.opener.closed) targets.push(window.opener); } catch (_) {}
+  try { if (window.parent && window.parent !== window) targets.push(window.parent); } catch (_) {}
+  try { if (window.top && window.top !== window && targets.indexOf(window.top) === -1) targets.push(window.top); } catch (_) {}
+  for (var i = 0; i < targets.length; i++) {
+    try { targets[i].postMessage(msg, OCX_PANEL_BASE); } catch (_) {}
+  }
+}
+// 锚点 #oauth-zai / #oauth-google：从 opencodex 的引导跳来时自动定位并预选。
+function applyHash() {
+  const m = (location.hash || "").match(/^#oauth-(zai|google)$/);
+  if (!m) return;
+  const v = m[1];
+  // 从面板跳来 → 预选一站式区块（ocxCard）的 vendor 并定位
+  const sel = document.getElementById("ocxVendor");
+  if (sel) sel.value = v;
+  const card = document.getElementById("ocxCard");
+  if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+window.addEventListener("hashchange", applyHash);
+applyHash();
+// 面板弹层打开时 iframe 从顶部加载 —— 自动把目标卡片滚进视野，省去手动滚动
+if (location.hash && location.hash !== "#") {
+  setTimeout(() => {
+    const card = document.getElementById("ocxCard");
+    if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, 600);
+}
+async function delAccount(uid) {
+  if (!confirm("确认删除账号 " + uid + " 的凭据？")) return;
+  try {
+    // 删 opencodex 池里的账号（本页登录写入的就是它）；老实现删的是 7863 池，删不到真实账号。
+    const res = await ocxApi("/api/oauth/accounts?provider=autoclaw&id=" + encodeURIComponent(uid), undefined, "DELETE");
+    if (!res.ok) throw new Error((res.body && res.body.error) || ("HTTP " + res.status));
+    alert("已从 opencodex 账号池删除 " + uid);
+    loadAccounts();
+  } catch (e) { alert("删除失败: " + e.message); }
+}
+loadAccounts();
+setInterval(loadAccounts, 30000);
+</script>
+</body>
+</html>
