@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # apply_global.sh — 给 opencodex 增加 workbuddy-global（CodeBuddy 国际版）OAuth provider。
+# 同时打配额补丁（patch_quota_global.py）：门①②+case+适配器+import 五处，
+# global 订阅制账号显示「订阅（累计消耗 N credits）」观测窗口。
 #
 # 与 apply.sh（workbuddy CN）同构：registry 条目 + oauth 模块 + OAUTH_PROVIDERS 注册 +
 # 错误透传。CN 与 Global 是两个独立 provider、独立账号池，互不影响。
@@ -114,6 +116,10 @@ esac
 
 # 模块每次刷新（自研文件幂等）
 cp "${SRC_DIR}/workbuddy-global-oauth.ts" "${MODULE}"
+QUOTA_MODULE_G="${PKG_DIR}/src/providers/workbuddy-global-quota.ts"
+QUOTA_TS="${PKG_DIR}/src/providers/quota.ts"
+QUOTA_ACCOUNT_CACHE="${PKG_DIR}/src/providers/quota/account-cache.ts"
+cp "${SRC_DIR}/workbuddy-global-quota.ts" "${QUOTA_MODULE_G}"
 
 if grep -q 'id: "workbuddy-global"' "${REGISTRY}" && grep -q '^  "workbuddy-global": {' "${OAUTH_INDEX}"; then
   printf '已打过补丁（模块已刷新）：%s\n' "${PKG_DIR}"
@@ -253,5 +259,14 @@ if [ "${STATUS}" -ne 0 ]; then
 fi
 
 verify_patch || exit 1
+
+# ── 配额支持（幂等；失败不回滚 provider 主功能——配额只是展示层）──
+if [ -f "${QUOTA_TS}" ]; then
+  OCX_QUOTA="${QUOTA_TS}" \
+    $([ -f "${QUOTA_ACCOUNT_CACHE}" ] && printf 'OCX_QUOTA_ACCOUNT_CACHE=%s ' "${QUOTA_ACCOUNT_CACHE}") \
+    python3 "${SRC_DIR}/patch_quota_global.py" || printf '⚠️ 配额补丁失败（不影响登录/对话）：见上方报错\n'
+else
+  printf '⚠️ 未找到 %s，跳过配额补丁\n' "${QUOTA_TS}"
+fi
 
 printf '\n完成：\n  ocx restart\n  ocx login workbuddy-global    # 浏览器授权 workbuddy.ai\n  ocx account list workbuddy-global\n'
