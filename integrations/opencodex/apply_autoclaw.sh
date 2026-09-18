@@ -55,7 +55,15 @@ OAUTH_MODULE="${PKG_DIR}/src/oauth/autoclaw.ts"
 QUOTA_TS="${PKG_DIR}/src/providers/quota.ts"
 QUOTA_MODULE="${PKG_DIR}/src/providers/autoclaw-quota.ts"
 TYPES_PROVIDER="${PKG_DIR}/src/types/provider.ts"
-ADAPTER_OPENAI_CHAT="${PKG_DIR}/src/adapters/openai-chat.ts"
+# 2.58.0 起上游两处拆包，锚点都换了文件，按存在性自适应：
+#   · providers/quota.ts         拆出 quota/account-cache.ts（门控函数在此）
+#   · adapters/openai-chat.ts    拆出 openai-chat/wire.ts（Authorization 注入在此）
+ACCOUNT_CACHE="${PKG_DIR}/src/providers/quota/account-cache.ts"
+if [ -f "${PKG_DIR}/src/adapters/openai-chat/wire.ts" ]; then
+  ADAPTER_OPENAI_CHAT="${PKG_DIR}/src/adapters/openai-chat/wire.ts"
+else
+  ADAPTER_OPENAI_CHAT="${PKG_DIR}/src/adapters/openai-chat.ts"
+fi
 
 for f in "${REGISTRY}" "${OAUTH_INDEX}" "${TYPES_PROVIDER}" "${ADAPTER_OPENAI_CHAT}"; do
   [ -f "${f}" ] || die "缺少文件：${f}（opencodex 结构可能已变）"
@@ -104,11 +112,18 @@ PROBE
   return 1
 }
 
+# OAUTH_PROVIDERS 对象内是否已注册指定 provider。只看该对象范围，避免误判：
+# 历史上补丁曾把条目误插进其后的 DEPRECATED_OAUTH_PROVIDER_ALIASES，那里也有 'autoclaw:' 字样。
+oauth_block_has_provider() {
+  awk '/^export const OAUTH_PROVIDERS/{f=1} /^export const DEPRECATED_OAUTH_PROVIDER_ALIASES/{f=0} f' "${OAUTH_INDEX}" 2>/dev/null \
+    | grep -q "^  $1: {"
+}
+
 MODE="${1:-apply}"
 case "${MODE}" in
   --check)
     if grep -q 'id: "autoclaw"' "${REGISTRY}" \
-       && grep -q '^  autoclaw: {' "${OAUTH_INDEX}" \
+       && oauth_block_has_provider autoclaw \
        && grep -q 'authHeaderName' "${TYPES_PROVIDER}" \
        && grep -q 'authHeaderName' "${ADAPTER_OPENAI_CHAT}"; then
       if grep -q 'case "autoclaw"' "${QUOTA_TS}" 2>/dev/null && [ -f "${QUOTA_MODULE}" ]; then
@@ -123,17 +138,23 @@ case "${MODE}" in
   --revert)
     latest="$(ls -1dt "${BACKUP_ROOT}"/* 2>/dev/null | head -1)"
     [ -n "${latest}" ] || die "没有可用备份（${BACKUP_ROOT}）"
-    for name in registry.ts oauth-index.ts types-provider.ts openai-chat.ts; do
+    for name in registry.ts oauth-index.ts types-provider.ts; do
       [ -f "${latest}/${name}" ] || die "备份不完整：${latest}/${name}"
     done
+    # 适配器备份：新版记作 adapter-openai-chat.ts（内容可能是 wire.ts 的快照），旧备份名为 openai-chat.ts
+    ADAPTER_BAK="${latest}/adapter-openai-chat.ts"
+    [ -f "${ADAPTER_BAK}" ] || ADAPTER_BAK="${latest}/openai-chat.ts"
+    [ -f "${ADAPTER_BAK}" ] || die "备份不完整：${latest}/adapter-openai-chat.ts"
     cp "${latest}/registry.ts" "${REGISTRY}"
     cp "${latest}/oauth-index.ts" "${OAUTH_INDEX}"
     cp "${latest}/types-provider.ts" "${TYPES_PROVIDER}"
-    cp "${latest}/openai-chat.ts" "${ADAPTER_OPENAI_CHAT}"
+    cp "${ADAPTER_BAK}" "${ADAPTER_OPENAI_CHAT}"
+    [ -f "${latest}/account-cache.ts" ] && cp "${latest}/account-cache.ts" "${ACCOUNT_CACHE}"
     rm -f "${OAUTH_MODULE}"
     rm -f "${QUOTA_MODULE}"
     if [ -f "${QUOTA_TS}" ]; then
-      OCX_QUOTA="${QUOTA_TS}" python3 "${SCRIPT_DIR}/patch_quota_autoclaw.py" --revert || true
+      OCX_QUOTA="${QUOTA_TS}" OCX_QUOTA_ACCOUNT_CACHE="${ACCOUNT_CACHE}" \
+        python3 "${SCRIPT_DIR}/patch_quota_autoclaw.py" --revert || true
     fi
     printf '已从 %s 恢复（并移除 autoclaw 配额模块）\n' "${latest}"
     exit 0
@@ -145,14 +166,16 @@ esac
 cp "${SCRIPT_DIR}/autoclaw-oauth.ts" "${OAUTH_MODULE}"
 cp "${SCRIPT_DIR}/autoclaw-quota.ts" "${QUOTA_MODULE}"
 
-# 配额支持（quota.ts 5 处 + 独立模块）；幂等。失败只警告——登录与对话不受影响。
+# 配额支持（门控在 account-cache.ts、分发在 quota.ts + 独立模块）；幂等。
+# 失败只警告——登录与对话不受影响。
 if [ -f "${QUOTA_TS}" ]; then
-  OCX_QUOTA="${QUOTA_TS}" python3 "${SCRIPT_DIR}/patch_quota_autoclaw.py" \
+  OCX_QUOTA="${QUOTA_TS}" OCX_QUOTA_ACCOUNT_CACHE="${ACCOUNT_CACHE}" \
+    python3 "${SCRIPT_DIR}/patch_quota_autoclaw.py" \
     || printf '⚠️ 配额补丁失败（不影响登录与对话）：见上方报错\n'
 fi
 
 if grep -q 'id: "autoclaw"' "${REGISTRY}" \
-   && grep -q '  autoclaw: {' "${OAUTH_INDEX}" \
+   && oauth_block_has_provider autoclaw \
    && grep -q 'authHeaderName' "${TYPES_PROVIDER}" \
    && grep -q 'authHeaderName' "${ADAPTER_OPENAI_CHAT}"; then
   printf '已打过补丁（模块已刷新）。%s\n' "${PKG_DIR}"
@@ -165,7 +188,8 @@ mkdir -p "${BACKUP_DIR}"
 cp "${REGISTRY}" "${BACKUP_DIR}/registry.ts"
 cp "${OAUTH_INDEX}" "${BACKUP_DIR}/oauth-index.ts"
 cp "${TYPES_PROVIDER}" "${BACKUP_DIR}/types-provider.ts"
-cp "${ADAPTER_OPENAI_CHAT}" "${BACKUP_DIR}/openai-chat.ts"
+cp "${ADAPTER_OPENAI_CHAT}" "${BACKUP_DIR}/adapter-openai-chat.ts"
+[ -f "${ACCOUNT_CACHE}" ] && cp "${ACCOUNT_CACHE}" "${BACKUP_DIR}/account-cache.ts"
 printf '备份：%s\n' "${BACKUP_DIR}"
 
 OCX_REGISTRY="${REGISTRY}" \
@@ -226,13 +250,87 @@ PROVIDER_DEF = '''  autoclaw: {
     defaultRefreshPolicy: "lazy-only",
   },
 '''
-patch_once(
-    '  autoclaw: {',
-    oauth_index_path,
-    '\n};\n\nexport function isOAuthProvider(',
-    '\n' + PROVIDER_DEF + '};\n\nexport function isOAuthProvider(',
-    "oauth/index.ts (OAUTH_PROVIDERS)",
-)
+# ⚠️ 同 apply.sh：不能用「OAUTH_PROVIDERS 结尾紧邻下一段代码」这类邻近锚点。
+# 上游 2.58.0 在其后插入了 DEPRECATED_OAUTH_PROVIDER_ALIASES 块，旧锚点 '\n};\n\nexport function
+# isOAuthProvider(' 会唯一命中那个【别名表】的结尾，把 provider 条目插进 Record<string,string> 里。
+# 改为按花括号配对定位 OAUTH_PROVIDERS 对象的结尾，并自愈历史污染。
+OAUTH_PROVIDERS_ANCHOR = 'export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {'
+ALIAS_ANCHOR = 'export const DEPRECATED_OAUTH_PROVIDER_ALIASES'
+
+
+def find_object_end(text, start):
+    """从 start 起找第一个 '{'，返回与之配对的 '}' 下标（跳过字符串与注释）。"""
+    i = text.index('{', start)
+    depth = 0
+    j = i
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c in "\"'`":
+            quote = c
+            j += 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    break
+                j += 1
+            j += 1
+            continue
+        if c == '/' and j + 1 < n and text[j + 1] == '/':
+            k = text.find('\n', j)
+            j = n if k < 0 else k + 1
+            continue
+        if c == '/' and j + 1 < n and text[j + 1] == '*':
+            k = text.find('*/', j + 2)
+            j = n if k < 0 else k + 2
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    raise SystemExit('apply_autoclaw: 无法定位对象的结束花括号（结构异常）')
+
+
+def register_autoclaw_provider(path):
+    text = open(path, encoding="utf-8").read()
+    if OAUTH_PROVIDERS_ANCHOR not in text:
+        raise SystemExit('apply_autoclaw: 找不到 OAUTH_PROVIDERS 定义：' + path)
+    dirty = False
+    # 自愈：清掉历史上被旧锚点误插进别名表里的条目（对象值，类型应为 string）
+    if ALIAS_ANCHOR in text:
+        a_start = text.index(ALIAS_ANCHOR)
+        a_end = find_object_end(text, a_start)
+        if 'autoclaw: {' in text[a_start:a_end]:
+            wb_start = text.index('\n  autoclaw: {', a_start)
+            wb_end = find_object_end(text, wb_start)
+            cut_end = wb_end + 1
+            if text[cut_end:cut_end + 2] == ',\n':
+                cut_end += 2
+            elif text[cut_end:cut_end + 1] == ',':
+                cut_end += 1
+            text = text[:wb_start] + text[cut_end:]
+            dirty = True
+            print('  已清理误插到 DEPRECATED_OAUTH_PROVIDER_ALIASES 里的 autoclaw 条目')
+
+    o_start = text.index(OAUTH_PROVIDERS_ANCHOR)
+    o_end = find_object_end(text, o_start)
+    if 'autoclaw:' in text[o_start:o_end]:
+        print('  已存在，跳过：oauth/index.ts (OAUTH_PROVIDERS)')
+    else:
+        text = text[:o_end] + PROVIDER_DEF + text[o_end:]
+        dirty = True
+        print('  已修改 oauth/index.ts (OAUTH_PROVIDERS)')
+
+    if dirty:
+        open(path, "w", encoding="utf-8").write(text)
+
+
+register_autoclaw_provider(oauth_index_path)
 
 ANCHOR = '\n  return "OAuth authentication failed. Check the OpenCodex account status and retry.";'
 patch_once(

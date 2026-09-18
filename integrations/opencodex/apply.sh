@@ -76,6 +76,8 @@ REGISTRY="${PKG_DIR}/src/providers/registry.ts"
 OAUTH_INDEX="${PKG_DIR}/src/oauth/index.ts"
 OAUTH_MODULE="${PKG_DIR}/src/oauth/workbuddy.ts"
 QUOTA_TS="${PKG_DIR}/src/providers/quota.ts"
+# 2.58.0 起 quota.ts 拆包：explicitAccountReader / explicitQuotaDestination 搬到了 quota/account-cache.ts
+ACCOUNT_CACHE="${PKG_DIR}/src/providers/quota/account-cache.ts"
 QUOTA_MODULE="${PKG_DIR}/src/providers/workbuddy-quota.ts"
 
 for f in "${REGISTRY}" "${OAUTH_INDEX}"; do
@@ -127,12 +129,19 @@ PROBE
   return 1
 }
 
+# OAUTH_PROVIDERS 对象内是否已注册 workbuddy。只看该对象范围，避免误判：
+# 历史上补丁曾把条目误插进其后的 DEPRECATED_OAUTH_PROVIDER_ALIASES，那里也会有 'workbuddy:' 字样。
+oauth_block_has_workbuddy() {
+  awk '/^export const OAUTH_PROVIDERS/{f=1} /^export const DEPRECATED_OAUTH_PROVIDER_ALIASES/{f=0} f' "${OAUTH_INDEX}" 2>/dev/null \
+    | grep -q '^  workbuddy: {'
+}
+
 MODE="${1:-apply}"
 
 case "${MODE}" in
   --check)
     if grep -q 'id: "workbuddy"' "${REGISTRY}" \
-       && grep -q '^  workbuddy: {' "${OAUTH_INDEX}" \
+       && oauth_block_has_workbuddy \
        && grep -q 'error instanceof WorkbuddyTokenError' "${OAUTH_INDEX}"; then
       printf '已打补丁：%s\n' "${PKG_DIR}"
       # 文本在位 ≠ 可用：再确认模块能加载、注册真的生效（升级后结构漂移靠这步兜住）。
@@ -151,6 +160,7 @@ case "${MODE}" in
     cp "${latest}/registry.ts" "${REGISTRY}"
     cp "${latest}/oauth-index.ts" "${OAUTH_INDEX}"
     cp "${latest}/quota.ts" "${QUOTA_TS}"
+    [ -f "${latest}/account-cache.ts" ] && cp "${latest}/account-cache.ts" "${ACCOUNT_CACHE}"
     rm -f "${OAUTH_MODULE}" "${QUOTA_MODULE}"
     printf '已从 %s 恢复（并删除 workbuddy.ts / workbuddy-quota.ts）\n' "${latest}"
     exit 0
@@ -169,9 +179,9 @@ cp "${SRC_DIR}/workbuddy-oauth.ts" "${OAUTH_MODULE}"
 cp "${SRC_DIR}/workbuddy-quota.ts" "${QUOTA_MODULE}"
 
 if grep -q 'id: "workbuddy"' "${REGISTRY}" \
-   && grep -q '  workbuddy: {' "${OAUTH_INDEX}" \
+   && oauth_block_has_workbuddy \
    && grep -q 'error instanceof WorkbuddyTokenError' "${OAUTH_INDEX}" \
-   && grep -q 'provider === "workbuddy"' "${QUOTA_TS}"; then
+   && grep -q 'provider === "workbuddy"' "${ACCOUNT_CACHE}" 2>/dev/null; then
   printf '已打过补丁（模块已刷新）。%s\n' "${PKG_DIR}"
   verify_patch
   exit $?
@@ -184,6 +194,7 @@ mkdir -p "${BACKUP_DIR}"
 cp "${REGISTRY}" "${BACKUP_DIR}/registry.ts"
 cp "${OAUTH_INDEX}" "${BACKUP_DIR}/oauth-index.ts"
 cp "${QUOTA_TS}" "${BACKUP_DIR}/quota.ts"
+[ -f "${ACCOUNT_CACHE}" ] && cp "${ACCOUNT_CACHE}" "${BACKUP_DIR}/account-cache.ts"
 printf '备份：%s\n' "${BACKUP_DIR}"
 
 # ── 打补丁（字符串手术交给 python3，避开 BSD sed 的坑） ───────────────
@@ -265,13 +276,89 @@ if ERROR_PASSTHROUGH_MARKER not in _index_text and LEGACY_IMPORT_LINE in _index_
     print("  已修改 src/oauth/index.ts (import 升级：补上 WorkbuddyTokenError)")
 
 # 3) oauth/index.ts: 注册 OAuth 后端
-patch_once(
-    '  workbuddy: {',
-    oauth_index_path,
-    '\n};\n\nexport function isOAuthProvider(',
-    '\n' + PROVIDER_DEF + '};\n\nexport function isOAuthProvider(',
-    "src/oauth/index.ts (OAUTH_PROVIDERS)",
-)
+# ⚠️ 锚点不能写成「OAUTH_PROVIDERS 的结尾紧邻下一段代码」。上游 2.58.0 在两者之间插入了
+# DEPRECATED_OAUTH_PROVIDER_ALIASES 块，旧锚点 '\n};\n\nexport function isOAuthProvider(' 于是唯一
+# 匹配到了那个【别名表】的结尾，provider 条目被插进 Record<string,string> 里 —— OAUTH_PROVIDERS
+# 中反而没有 workbuddy，listOAuthProviders() 不含它，冒烟校验报 oauthRegistered:false，
+# 且别名表类型错误可能让代理起不来。这里改为「花括号配对定位 OAUTH_PROVIDERS 对象的结尾」，
+# 与后续代码形态解耦；同时自愈历史污染（把误插进别名表的条目摘掉）。
+OAUTH_PROVIDERS_ANCHOR = 'export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {'
+ALIAS_ANCHOR = 'export const DEPRECATED_OAUTH_PROVIDER_ALIASES'
+
+
+def find_object_end(text, start):
+    """从 start 起找第一个 '{'，返回与之配对的 '}' 下标（跳过字符串与注释）。"""
+    i = text.index('{', start)
+    depth = 0
+    j = i
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c in "\"'`":
+            quote = c
+            j += 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    break
+                j += 1
+            j += 1
+            continue
+        if c == '/' and j + 1 < n and text[j + 1] == '/':
+            k = text.find('\n', j)
+            j = n if k < 0 else k + 1
+            continue
+        if c == '/' and j + 1 < n and text[j + 1] == '*':
+            k = text.find('*/', j + 2)
+            j = n if k < 0 else k + 2
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    raise SystemExit('apply: 无法定位对象的结束花括号（结构异常）')
+
+
+def patch_oauth_registration(path):
+    text = open(path, encoding='utf-8').read()
+    if OAUTH_PROVIDERS_ANCHOR not in text:
+        raise SystemExit('apply: 找不到 OAUTH_PROVIDERS 定义，opencodex 结构可能已变：' + path)
+    dirty = False
+    # 自愈：清掉历史上被旧锚点误插进别名表里的 provider 条目（对象值，类型应为 string）
+    if ALIAS_ANCHOR in text:
+        a_start = text.index(ALIAS_ANCHOR)
+        a_end = find_object_end(text, a_start)
+        if 'workbuddy: {' in text[a_start:a_end]:
+            wb_start = text.index('\n  workbuddy: {', a_start)
+            wb_end = find_object_end(text, wb_start)
+            cut_end = wb_end + 1
+            if text[cut_end:cut_end + 2] == ',\n':
+                cut_end += 2
+            elif text[cut_end:cut_end + 1] == ',':
+                cut_end += 1
+            text = text[:wb_start] + text[cut_end:]
+            dirty = True
+            print('  已清理误插到 DEPRECATED_OAUTH_PROVIDER_ALIASES 里的 workbuddy 条目')
+
+    o_start = text.index(OAUTH_PROVIDERS_ANCHOR)
+    o_end = find_object_end(text, o_start)
+    if 'workbuddy:' in text[o_start:o_end]:
+        print('  已存在，跳过：src/oauth/index.ts (OAUTH_PROVIDERS)')
+    else:
+        text = text[:o_end] + PROVIDER_DEF + text[o_end:]
+        dirty = True
+        print('  已修改 src/oauth/index.ts (OAUTH_PROVIDERS)')
+
+    if dirty:
+        open(path, 'w', encoding='utf-8').write(text)
+
+
+patch_oauth_registration(oauth_index_path)
 
 # 4) oauth/index.ts: 让 WorkbuddyTokenError 的真实 message 透传到 UI
 patch_once(
@@ -302,7 +389,7 @@ fi
 
 # ── 配额支持（quota.ts 4 处改动 + 独立模块）───────────────────────────
 # 幂等；锚点失配会报错但不回滚 OAuth 部分（quota 只是展示层增强）。
-OCX_QUOTA="${QUOTA_TS}" OCX_QUOTA_SNIPPET="${SRC_DIR}/workbuddy-quota.ts" \
+OCX_QUOTA="${QUOTA_TS}" OCX_QUOTA_ACCOUNT_CACHE="${ACCOUNT_CACHE}" OCX_QUOTA_SNIPPET="${SRC_DIR}/workbuddy-quota.ts" \
   python3 "${SRC_DIR}/patch_quota.py" || printf '⚠️ 配额补丁失败（不影响 OAuth 主功能）：见上方报错\n'
 
 verify_patch || exit 1
