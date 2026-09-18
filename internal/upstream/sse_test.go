@@ -148,6 +148,444 @@ data: [DONE]
 	}
 }
 
+// TestAggregateNonDeltaMessageMergesToolCalls RED：上游用非 delta 的完整 message
+// 下发（含 tool_calls / reasoning_content / role）时，Aggregate 的 message 回退分支
+// 只合并 content——tool_calls、reasoning_content、role 全部丢失。规约：该兜底分支
+// 应与 delta 分支同构，至少合并 tool_calls 与 role（非编造，上游给了就透）。
+func TestAggregateNonDeltaMessageMergesToolCalls(t *testing.T) {
+	raw := `data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"glm-5.2","choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"think think","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]}}],"usage":null}
+data: {"id":"x1","choices":[{"index":0,"message":{},"finish_reason":"tool_calls"}],"usage":{"total_tokens":11}}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason=%v", choice["finish_reason"])
+	}
+	msg := choice["message"].(map[string]any)
+	if msg["role"] != "assistant" {
+		t.Errorf("role=%v want assistant (missed by content-only message fallback)", msg["role"])
+	}
+	if msg["reasoning_content"] != "think think" {
+		t.Errorf("reasoning_content=%v", msg["reasoning_content"])
+	}
+	calls, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("tool_calls=%#v (dropped by content-only message fallback)", msg["tool_calls"])
+	}
+	if calls[0]["id"] != "call_a" || calls[0]["type"] != "function" {
+		t.Errorf("call meta=%v", calls[0])
+	}
+	fn := calls[0]["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["arguments"] != `{"city":"北京"}` {
+		t.Errorf("fn=%v", fn)
+	}
+}
+
+// TestAggregateToolCallsNoIndexNotCollapsed RED：上游省略 tool_call 的 index
+// （规范要求但部分上游省略）时，不同调用不得被合并进同一 index 槽——此前缺 index
+// 一律归 0，多调用被合并、arguments 串联污染、name 互相覆盖。规约：同帧缺 index
+// 按到达顺序分配递增序号，后续帧缺 index 延续最近槽位（单调用延续形态）。
+func TestAggregateToolCallsNoIndexNotCollapsed(t *testing.T) {
+	raw := `data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f1","arguments":"{\"a\":1}"}}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"f2","arguments":"{\"b\":2}"}}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	calls, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("two distinct tool_calls must not collapse: %#v", msg["tool_calls"])
+	}
+	// 两个 call 各自独立：arguments 不串联、name 不被覆盖。
+	argSets := map[string]bool{}
+	names := map[string]bool{}
+	for _, c := range calls {
+		fn := c["function"].(map[string]any)
+		argSets[fn["arguments"].(string)] = true
+		names[fn["name"].(string)] = true
+	}
+	if !argSets[`{"a":1}`] || !argSets[`{"b":2}`] {
+		t.Errorf("arguments must stay separate, got %v", argSets)
+	}
+	if !names["f1"] || !names["f2"] {
+		t.Errorf("names must stay separate, got %v", names)
+	}
+}
+
+// TestAggregateToolCallsMixedIndexAbsent 混合形态：全流共用一个 index-0 的合规 call，
+// 中途混入一个缺 index 的新 call——缺 index 的补位不得覆盖既有 index-0 槽
+// （nextToolIndex 从 toolSeq 递增跳过既有 index）。
+func TestAggregateToolCallsMixedIndexAbsent(t *testing.T) {
+	raw := `data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"f1","arguments":"{\"a\":1}"}}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"f2","arguments":"{\"b\":2}"}}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	calls, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("mixed index forms must produce 2 calls: %#v", msg["tool_calls"])
+	}
+	// 两个调用 index 互异（新分配的补位序号 ≠ 既有 0）。
+	seen := map[int]bool{}
+	for _, c := range calls {
+		seen[c["index"].(int)] = true
+	}
+	if len(seen) != 2 || !seen[0] {
+		t.Errorf("indexes=%v want two distinct incl. 0", seen)
+	}
+}
+
+// TestAggregateToolCallsIdCarriedAcrossFrames 上游缺 index 但每帧都带同 id 的
+// 延续形态：call_a 的碎片跨两帧（id 都带）必须归位到同一调用，不因跨帧拆分。
+func TestAggregateToolCallsIdCarriedAcrossFrames(t *testing.T) {
+	raw := `data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"f1","arguments":"{\"a\":"}}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"1}"}}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	calls, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("same-id continuation across frames must stay one call: %#v", msg["tool_calls"])
+	}
+	fn := calls[0]["function"].(map[string]any)
+	if fn["arguments"] != `{"a":1}` {
+		t.Errorf("arguments=%q want {\"a\":1}", fn["arguments"])
+	}
+}
+
+// TestAggregateEOFDropsTruncatedToolCalls RED：上游流被掐断（EOF 收尾、无 [DONE]、
+// 无 finish_reason）时，tool_calls 的 arguments 是残缺 JSON。规约：截断来源
+// 除 finish_reason=="length" 外还包括连接中断（sawDone=false）——残缺调用必须
+// 丢弃，否则客户端解析非法 JSON 卡死会话；正常 [DONE] 收尾的完整调用不受影响。
+func TestAggregateEOFDropsTruncatedToolCalls(t *testing.T) {
+	raw := `data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"cmd\":"},"index":0}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"ls\""},"index":0}]}}]}` // EOF 截断，无 DONE
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("EOF-truncated stream must still aggregate: %v", err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+	if calls, ok := msg["tool_calls"].([]map[string]any); ok && len(calls) != 0 {
+		t.Fatalf("truncated tool_calls must be dropped: %#v", msg["tool_calls"])
+	}
+}
+
+// TestAggregateDoneKeepsCompleteToolCall 回归：正常 [DONE] 收尾的完整 tool_calls
+// 不被 dropTruncatedToolCalls 误伤（对照 EOF 分支，sawDone 不应触发丢弃）。
+func TestAggregateDoneKeepsCompleteToolCall(t *testing.T) {
+	raw := `data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"},"index":0}]}}]}
+data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+	calls, ok := msg["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("complete tool_calls must be kept: %#v", msg["tool_calls"])
+	}
+	fn := calls[0]["function"].(map[string]any)
+	if fn["arguments"] != `{"city":"北京"}` {
+		t.Errorf("args=%v", fn["arguments"])
+	}
+}
+
+// TestEnsureUsageTotalSynthesizesMissingTotal RED：上游末帧 usage 缺 total_tokens
+// 但 prompt_tokens/completion_tokens 都在时，非流式聚合必须补齐 total（OpenAI
+// 非流式 usage 必含该字段）。已有 total / 缺单边 / 无 usage 三形态保持原样。
+func TestEnsureUsageTotalSynthesizesMissingTotal(t *testing.T) {
+	// 缺 total：补齐
+	syn := ensureUsageTotal(map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(5)})
+	if syn["total_tokens"] != float64(15) {
+		t.Errorf("synthesized total=%v want 15", syn["total_tokens"])
+	}
+	// 已有 total：不覆盖
+	keep := ensureUsageTotal(map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(5), "total_tokens": float64(100)})
+	if keep["total_tokens"] != float64(100) {
+		t.Errorf("existing total must not be overridden: %v", keep["total_tokens"])
+	}
+	// 缺单边：不合成
+	half := ensureUsageTotal(map[string]any{"prompt_tokens": float64(10)})
+	if _, ok := half["total_tokens"]; ok {
+		t.Errorf("must not synthesize with only one side present: %v", half)
+	}
+	// 集成：SSE 末帧 usage 缺 total → 聚合响应含补齐的 total
+	raw := `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+data: [DONE]
+
+`
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := resp["usage"].(map[string]any)
+	if u["total_tokens"] != float64(15) {
+		t.Errorf("aggregated usage total=%v want 15 (integration)", u["total_tokens"])
+	}
+	// 集成不可变：合成走新 map，原上游 usage map 不被改写。
+	src := map[string]any{"prompt_tokens": float64(10), "completion_tokens": float64(5)}
+	_ = ensureUsageTotal(src)
+	if _, polluted := src["total_tokens"]; polluted {
+		t.Errorf("ensureUsageTotal must not mutate the input map: %#v", src)
+	}
+}
+
+// TestStripToolCallNames 直测跨帧 name 收敛：首片保留 name、同 index 后续分片删除
+// name 键（空串或重复非空串都删），不同 index 互不串扰，非 tool_calls 帧零影响。
+func TestStripToolCallNames(t *testing.T) {
+	mkFrame := func(idx float64, name, args string) map[string]any {
+		fn := map[string]any{}
+		if name != "" {
+			fn["name"] = name
+		}
+		if args != "" {
+			fn["arguments"] = args
+		}
+		return map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"tool_calls": []any{
+				map[string]any{"index": idx, "function": fn},
+			}}},
+		}}
+	}
+	getFn := func(f map[string]any) map[string]any {
+		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	}
+	seen := map[int]bool{}
+
+	// 首片带 name：保留，seen 建立
+	f0 := mkFrame(0, "lookup", "")
+	stripToolCallNames(f0, seen)
+	if !seen[0] {
+		t.Fatal("index 0 should be marked seen after first chunk")
+	}
+	if getFn(f0)["name"] != "lookup" {
+		t.Errorf("first chunk name=%v want lookup", getFn(f0)["name"])
+	}
+
+	// 后续 chunk name 为空串：删除 name 键
+	f1 := mkFrame(0, "", `{"term":"x"}`)
+	stripToolCallNames(f1, seen)
+	if _, ok := getFn(f1)["name"]; ok {
+		t.Errorf("subsequent empty name should be stripped: %#v", getFn(f1))
+	}
+	if getFn(f1)["arguments"] != `{"term":"x"}` {
+		t.Errorf("arguments altered: %#v", getFn(f1)["arguments"])
+	}
+
+	// 后续 chunk 重复非空 name（上游噪声）：同样删除，arguments 原样
+	f2 := mkFrame(0, "lookup", "y")
+	stripToolCallNames(f2, seen)
+	if _, ok := getFn(f2)["name"]; ok {
+		t.Errorf("subsequent duplicate non-empty name should be stripped: %#v", getFn(f2))
+	}
+	if getFn(f2)["arguments"] != "y" {
+		t.Errorf("arguments altered: %#v", getFn(f2)["arguments"])
+	}
+
+	// 不同 index 互不串扰：index 1 首片保留 name
+	f3 := mkFrame(1, "other", "")
+	stripToolCallNames(f3, seen)
+	if getFn(f3)["name"] != "other" {
+		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
+	}
+	if !seen[1] {
+		t.Error("index 1 should be marked seen")
+	}
+
+	// 非 tool_calls 帧（content only）零影响
+	f4 := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"content": "hi"}},
+	}}
+	stripToolCallNames(f4, seen)
+	if got := f4["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
+		t.Errorf("content-only frame altered: %#v", got)
+	}
+}
+
+// TestStreamToolCallNameOnce 11 帧 tool_call：首帧 name=Bash，后续 10 帧不得携带
+// name 键，arguments 逐帧原样透传（issue #82：累加型客户端把每个分片 name 拼接成
+// Bash×帧数；正确行为是 name 只在首帧出现一次）。
+func TestStreamToolCallNameOnce(t *testing.T) {
+	const nFrames = 11
+	var sb strings.Builder
+	for i := 0; i < nFrames; i++ {
+		sb.WriteString(`data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"arg` + string(rune('0'+i)) + `"}}]}}]}`)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("data: [DONE]\n\n")
+
+	frames, done := streamFrames(t, sb.String())
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != nFrames {
+		t.Fatalf("frames=%d want %d", len(frames), nFrames)
+	}
+	gotName := 0
+	for i, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		if len(tcs) != 1 {
+			t.Fatalf("frame %d tool_calls len=%d want 1", i, len(tcs))
+		}
+		fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+		if _, ok := fn["name"]; ok {
+			gotName++
+			if i != 0 || fn["name"] != "Bash" {
+				t.Errorf("frame %d unexpected name=%v (name 只能出现在首帧且为 Bash)", i, fn["name"])
+			}
+		}
+		if want := "arg" + string(rune('0'+i)); fn["arguments"] != want {
+			t.Errorf("frame %d arguments=%v want %q", i, fn["arguments"], want)
+		}
+	}
+	if gotName != 1 {
+		t.Errorf("name 出现帧数=%d want 1", gotName)
+	}
+}
+
+// TestStreamToolCallParallelFragments 多 tool_call（index 0 与 1 并行分片交错下发）：
+// 每个 index 只保留自己的首帧 name，后续分片互不串扰、arguments 各自原样。
+func TestStreamToolCallParallelFragments(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"a0\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"Read\",\"arguments\":\"a1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+
+	argByIndex := map[int]string{}
+	nameCount := map[int]int{}
+	for _, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			idx := int(tc["index"].(float64))
+			fn, _ := tc["function"].(map[string]any)
+			if _, ok := fn["name"]; ok {
+				nameCount[idx]++
+			}
+			if a, _ := fn["arguments"].(string); a != "" {
+				argByIndex[idx] = a
+			}
+		}
+	}
+	// 每个 index 恰好出现一次 name，arguments 逐片原样（a0/a1 各自保留）
+	if nameCount[0] != 1 || nameCount[1] != 1 {
+		t.Errorf("name 出现次数 index0=%d index1=%d，各 want 1", nameCount[0], nameCount[1])
+	}
+	if argByIndex[0] != "a0" || argByIndex[1] != "a1" {
+		t.Errorf("arguments index0=%q index1=%q want a0/a1", argByIndex[0], argByIndex[1])
+	}
+}
+
+// TestStreamToolCallNoiseEmptyName 上游后续帧带空串 name（噪声形态）→ 输出帧无 name 键。
+// 键缺失是比空串更安全的形态，客户端「键缺失则保留旧值」不会清空工具名。
+func TestStreamToolCallNoiseEmptyName(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg2\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	for i, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			fn, _ := tc["function"].(map[string]any)
+			if i == 0 {
+				if fn["name"] != "lookup" {
+					t.Errorf("frame 0 name=%v want lookup", fn["name"])
+				}
+				continue
+			}
+			if _, ok := fn["name"]; ok {
+				t.Errorf("frame %d: 空串 name 应被剥离为键缺失, got %#v", i, fn)
+			}
+		}
+	}
+}
+
+// TestStreamToolCallOverwriteClientSemantics 覆盖型语义验证：模拟「键缺失则保留旧值」
+// 的覆盖型客户端（name ?? state.name / if (name) state.name = name），在输出流上逐帧
+// 重建 name，最终必须收敛为 Bash——证明键缺失形态不会清空工具名。
+func TestStreamToolCallOverwriteClientSemantics(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	state := map[int]string{}
+	reconstructed := map[int]string{}
+	for _, fr := range frames {
+		chs, _ := fr["choices"].([]any)
+		d, _ := chs[0].(map[string]any)["delta"].(map[string]any)
+		tcs, _ := d["tool_calls"].([]any)
+		for _, tci := range tcs {
+			tc, _ := tci.(map[string]any)
+			idx := int(tc["index"].(float64))
+			fn, _ := tc["function"].(map[string]any)
+			// 覆盖型语义：键缺失 → ?? 保留旧值；非空 name → 覆盖。
+			if name, ok := fn["name"]; ok {
+				state[idx] = name.(string)
+			}
+			if state[idx] != "" {
+				reconstructed[idx] = state[idx]
+			}
+		}
+	}
+	// 覆盖型客户端重建后最终 name 必须是 Bash（首帧建立，后续空/重复分片均不破坏）。
+	if len(reconstructed) != 1 || reconstructed[0] != "Bash" {
+		t.Errorf("覆盖型重建 name=%v want map[0:Bash]", reconstructed)
+	}
+}
+
 // streamFrames 把原始 SSE 输入经 Stream 处理后解析出所有 JSON 帧及 [DONE] 计数。
 func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount int) {
 	t.Helper()
@@ -280,6 +718,49 @@ func TestStreamNormalizesFrames(t *testing.T) {
 	}
 	if f2["usage"].(map[string]any)["total_tokens"].(float64) != 7 {
 		t.Errorf("frame3 usage=%v", f2["usage"])
+	}
+}
+
+// TestStreamFirstIdPassthrough 帧混合（首帧有 id / 中间帧无 id / 空串 id）：输出每帧 id
+// 必须连续一致（取首帧真实值），不再一律 chatcmpl-wb2api（issue #35 后台聚合：透传流里
+// 每帧同 id 才能按消息归并）。
+func TestStreamFirstIdPassthrough(t *testing.T) {
+	raw := "data: {\"id\":\"chatcmpl-upstream-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		// 中间帧无 id：应复用首帧 id。
+		"data: {\"object\":\"chat.completion.chunk\",\"created\":1,\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n" +
+		// 中间帧 id 为空串：同样复用首帧 id。
+		"data: {\"id\":\"\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d want 3", len(frames))
+	}
+	for i, fr := range frames {
+		if got := fr["id"]; got != "chatcmpl-upstream-9" {
+			t.Errorf("frame %d id=%v want chatcmpl-upstream-9 (首帧真实 id 续传)", i, got)
+		}
+	}
+}
+
+// TestStreamNoIdFallsBackToSentinel 全流无任何真实 id → 兜底 chatcmpl-wb2api
+// （整流无 id 时的既有哨兵，帧与帧之间仍一惯性存在）。
+func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
+	raw := "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}," +
+		"\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	frames, _ := streamFrames(t, raw)
+	if len(frames) != 2 {
+		t.Fatalf("frames=%d want 2", len(frames))
+	}
+	for i, fr := range frames {
+		if got := fr["id"]; got != "chatcmpl-wb2api" {
+			t.Errorf("frame %d id=%v want sentinel chatcmpl-wb2api (无真实 id)", i, got)
+		}
 	}
 }
 
@@ -437,7 +918,7 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 						continue
 					}
 					if json.Unmarshal([]byte(payload), &e) == nil {
-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
+						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" && em["code"] == "upstream_parse" {
 							found = true
 						}
 					}
@@ -447,6 +928,35 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 				t.Errorf("error frame absent or error field stripped: %q", body)
 			}
 		})
+	}
+}
+
+// TestStreamMidStreamErrorFramePassthrough error-passthrough：SSE 流中带上游 error 帧
+// （如 6004 限流/审核拦截）时，该帧**原样透传**（error 字段不被 normalizeFrame 白名单
+// 剥掉），message/code/requestId 原文可见；且干净帧仍规范化透传、恰好一个 [DONE]。
+func TestStreamMidStreamErrorFramePassthrough(t *testing.T) {
+	const errFrame = `{"error":{"message":"您的使用量已超出频率限制","code":"6004","requestId":"req-rl-42"}}`
+	raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		"data: " + errFrame + "\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	// 错误帧原文存续：message/code/requestId 都在。
+	if !strings.Contains(body, "您的使用量已超出频率限制") ||
+		!strings.Contains(body, `"code":"6004"`) ||
+		!strings.Contains(body, `"requestId":"req-rl-42"`) {
+		t.Fatalf("error frame must pass through verbatim (message/code/requestId): %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, body)
+	}
+	// 干净帧仍被规范化透传（error 帧不计入规范化路径，不影响普通帧）。
+	if !strings.Contains(body, `"role":"assistant"`) || !strings.Contains(body, `"content":"hello"`) {
+		t.Errorf("clean frame missing or not normalized: %q", body)
 	}
 }
 
@@ -500,5 +1010,29 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 				t.Errorf("frame not normalized: %q", body)
 			}
 		})
+	}
+}
+
+// TestAggregateNonDeltaMessageContentNotDuplicated 上游把**完整消息**放在 choices[].message
+// （非 delta）且每帧都带时，内容不得被逐帧重复追加。
+//
+// 缺陷：`!gotAnyContent` 守卫的 message 回退分支写入了 content 却从未置 gotAnyContent=true，
+// 守卫永不latch——对「每帧都带完整 message」的上游（正是该分支注释所描述的形态），
+// 聚合结果里 message 正文会重复 N 遍（N = 帧数）。
+//
+// 断言：三帧各带完整 message（delta 无 content）→ content 恰为该文本一份。
+// 修复前得到 "abcabcabc" → RED。
+func TestAggregateNonDeltaMessageContentNotDuplicated(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"abc\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"abc\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"abc\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":3}}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "abc" {
+		t.Errorf("content=%q want %q（message 回退分支应只采一次）", msg["content"], "abc")
 	}
 }

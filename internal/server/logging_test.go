@@ -38,7 +38,10 @@ func withChatLog(t *testing.T) {
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {
-	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	// 起点回拨 1ms：内存流（strings.Reader）瞬时返回，用 time.Now() 作起点会让
+	// ttfb=time.Since(start) 在同一时钟滴答内测得 0（Windows 精度 ~0.5ms 尤甚）。
+	// 生产 SSE 是网络流 ttfb 必然 >0；此处回拨起点模拟"已过一段时间"的可分辨测量。
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now().Add(-time.Millisecond))
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
@@ -69,6 +72,59 @@ func TestChatStatsReaderLastFrameUsageWins(t *testing.T) {
 	toks, ok := r.Tokens()
 	if !ok || toks != 12 {
 		t.Fatalf("tokens=%d ok=%v, want 12 (last frame wins)", toks, ok)
+	}
+}
+
+// TestChatStatsReaderCreditMissing (P0, RED): usage 存在但 credit 字段缺失时
+// Credit() 必须返回 ok=false——缺失≠免费，不能把缺观测当 0 扣费记入账本
+// （否则收费的 global 号可能被误判 tier0 免费被永久优先）。
+func TestChatStatsReaderCreditMissing(t *testing.T) {
+	sse := "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	if toks, ok := r.Tokens(); !ok || toks != 5 {
+		t.Fatalf("tokens=%d ok=%v want 5/true (usage still供 token)", toks, ok)
+	}
+	credit, ok := r.Credit()
+	if ok {
+		t.Errorf("Credit()=(%v,true) want ok=false: usage 无 credit 字段 ≠ 0 成本", credit)
+	}
+}
+
+// TestChatStatsReaderCreditExplicitZero (P0, RED/GREEN): usage 显式 credit:0 是合法免费观测，
+// Credit() 必须 ok=true 且 credit==0——真 0 不许丢（显式 0 与字段缺失语义不同）。
+func TestChatStatsReaderCreditExplicitZero(t *testing.T) {
+	sse := "data: {\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":500,\"credit\":0}}\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	credit, ok := r.Credit()
+	if !ok || credit != 0 {
+		t.Errorf("Credit()=(%v,%v) want (0,true): 显式 credit:0 是合法免费观测", credit, ok)
+	}
+}
+
+// TestChatStatsReaderJSONNullCredit 回归保护：usage.credit 显式 null 也算缺失
+// （null ≠ 0），不得被当作免费观测。
+func TestChatStatsReaderJSONNullCredit(t *testing.T) {
+	sse := "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"credit\":null}}\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	if _, ok := r.Credit(); ok {
+		t.Error("usage.credit=null 应视为缺失（ok=false）")
+	}
+}
+
+// TestChatStatsReaderNoUsage 末帧完全无 usage → Credit() ok=false（现状已对，回归保护）。
+func TestChatStatsReaderCreditNoUsage(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	if _, ok := r.Credit(); ok {
+		t.Error("无 usage 帧 Credit() 应 ok=false")
 	}
 }
 
@@ -142,10 +198,10 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4.1-flash", "stream", "00e26541abcdef", "sample", http.StatusOK, 1234)
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4.1-flash", "| stream |", "| 200 |", "sample(00e26541)", "TTFB=412ms", "tok=1234", "tok/s", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -156,23 +212,56 @@ func TestLogChatRowFormat(t *testing.T) {
 	}
 }
 
+// TestLogChatRowModelNotTruncated 守护模型名不再被截断。
+// 旧实现硬截 11 字节，把 "cn:deepseek-v4.1-flash" 切成 "cn:deepseek"，
+// 运维会误以为是另一个模型（真实踩坑点）。26 列宽覆盖 realm 前缀 + 最长模型名。
+func TestLogChatRowModelNotTruncated(t *testing.T) {
+	withChatLog(t)
+	for _, model := range []string{"cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash"} {
+		out := captureStdout(t, func() {
+			logChatRow(0, time.Second, model, "stream", "00e26541abcdef", "sample", http.StatusOK, 1)
+		})
+		if !strings.Contains(out, model) {
+			t.Errorf("model %q truncated to something else:\n%s", model, out)
+		}
+	}
+}
+
+// TestLogChatRowNicknameFallback 无昵称（旧 auth 文件未落 account.nickname）时退回 uid8。
+func TestLogChatRowNicknameFallback(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", "", http.StatusOK, 1)
+	})
+	if !strings.Contains(out, "00e26541 ") && !strings.Contains(out, "00e26541|") {
+		t.Errorf("want bare uid8 label without nickname:\n%s", out)
+	}
+	if strings.Contains(out, "(") {
+		t.Errorf("empty nickname must not render parens:\n%s", out)
+	}
+}
+
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1)
 	})
-	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"TTFB=-", "tok=-", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
+	}
+	// 无 usage 时速率列也应是裸 "-"，不能凭空报 0.0tok/s（会把缺失当零值读）。
+	if strings.Contains(out, "0.0tok/s") || strings.Contains(out, "-tok/s") {
+		t.Errorf("missing usage must render bare '-' rate column:\n%s", out)
 	}
 }
 
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -205,13 +294,48 @@ func TestChatLogsStreamRow(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "tok=1"} {
+	for _, want := range []string{"| stream |", "| 200 |", "| u1 ", "TTFB=", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream row missing %q:\n%s", want, out)
 		}
 	}
 	if !strings.Contains(out, "tok=1") {
 		t.Errorf("tok: want precise usage completion_tokens: %s", out)
+	}
+}
+
+// sseNoUsage 与 sseOK 同形但末帧不带 usage 子对象（上游未回报口径）。
+const sseNoUsage = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"你好\"}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestChatLogsStreamRowNoUsageShowsDash 流式末帧无 usage 时 tok 列应显示 "-"。
+// chatStat.toks 初值 -1 即「观测缺失」哨兵（见字段注释与 logChatRow 的 toks<0
+// 分支），不得被 stats.Tokens() 的零值 0 覆盖成「测得 0 token」——后者是把「缺观测」
+// 伪装成「测得 0」的伪造观测（tok=0 tok/s=0.0）。非流式同场景走 completionTokens
+// 返回 -1 保留了哨兵，两条路径口径必须一致。
+func TestChatLogsStreamRowNoUsageShowsDash(t *testing.T) {
+	withChatLog(t)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseNoUsage, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	})
+	if !strings.Contains(out, "tok=-") {
+		t.Errorf("流式无 usage 应显示 tok=-（观测缺失），实际:\n%s", out)
+	}
+	if strings.Contains(out, "tok=0") {
+		t.Errorf("流式无 usage 被伪造成 tok=0（测得 0 token）:\n%s", out)
 	}
 }
 
@@ -232,7 +356,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| sync |", "| 200 |", "TTFB=-", "tok=1"} {
+	for _, want := range []string{"| sync ", "| 200 |", "TTFB=-", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("sync row missing %q:\n%s", want, out)
 		}
@@ -254,7 +378,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"uid=u1", "| 503 |", "tok=-"} {
+	for _, want := range []string{"| u1 ", "| 503 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}
