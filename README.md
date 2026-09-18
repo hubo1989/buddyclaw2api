@@ -170,6 +170,9 @@ curl http://127.0.0.1:7863/v1/chat/completions \
 | `autoclaw/tdpsk_deepseek-v4-flash-202605` | DeepSeek-V4.1-Flash |
 | `autoclaw/tdpsk_deepseek-v4-pro-202606` | DeepSeek-V4-Pro |
 
+> 注：`tdpsk_deepseek-v4-flash-202605` 是**路由 ID**（即请求头 `X-Request-Model` 的值），AutoClaw 客户端界面把它显示为
+> **Deepseek-V4.1-Flash** —— ID 里不含小版本号，别把它误读成 4.0。
+
 ### 行为说明
 
 - **token 自管**：服务独立持有 refresh token（`/userapi/v1/refresh`，轮换写回凭据文件），临期自动刷新；与 WorkBuddy 上游同语义。
@@ -177,6 +180,9 @@ curl http://127.0.0.1:7863/v1/chat/completions \
 - **账号独占**：⚠️ 同一手机号**不要**同时在 AutoClaw 桌面端登录 —— 双方各自轮换 refresh token 会互踢，表现为其中一方频繁 401。
 - **错误处理**：401 → 自动刷新重试一次，仍失败标记 `needs_relogin`（`/status` 可见，需重新运行登录命令）；429 → 60s 软冷却；积分不足 → 冷却到次日 04:00；非法模型 → 400 原样透传。
 - **协议来源**：AutoClaw.app 1.18.1 客户端逆向 + 实测（详见 `docs/specs/2026-09-11-autoclaw-provider.md`）。**非官方 API**，客户端版本升级可能导致协议漂移（签名/端点/模型白名单变化），届时需更新 `internal/autoclaw` 的常量。
+
+> 想把 `autoclaw/*` 模型接进 Codex CLI / Claude Code，或在 opencodex 面板里直接管理 AutoClaw 账号池，
+> 见下文「接入 opencodex」中的 **把 workbuddy / autoclaw 内置进 opencodex** 一节。
 
 ## 配置说明
 
@@ -365,6 +371,58 @@ curl -s http://127.0.0.1:10100/v1/chat/completions \
 
 撤销：`ocx provider remove workbuddy`。
 
+### 把 workbuddy / autoclaw 内置进 opencodex（OAuth 账号池）
+
+上面 `ocx provider add` 那条路只能拿到 **API-key 池**（且换号只在 429 时触发）。原因是 opencodex 的 OAuth 账号池 ——
+`~/.opencodex/auth.json` 里的 `accounts[]`、额度窗口、后台续期 —— **只对内置 provider 开放**：
+要求 provider 在 registry 里带 `authKind: "oauth"`，并有内置的登录/刷新实现。
+
+本仓库用**幂等补丁脚本**（[`integrations/opencodex/`](integrations/opencodex/)）把 `workbuddy` 与 `autoclaw`
+变成真正的内置 provider，从而拿到完整的 OAuth 池能力：
+
+| 脚本 | 作用 |
+|---|---|
+| `apply.sh` | 注入 `workbuddy` 内置 provider（registry 条目 + `OAUTH_PROVIDERS` 注册 + 额度显示） |
+| `apply_autoclaw.sh` | 注入 `autoclaw` 内置 provider，含 `authHeaderName: X-Authorization` 适配（AutoClaw 网关只认这个头） |
+| `apply_gui.sh` | 注入 AutoClaw 账号管理页（静态页 + `/providers` 浮动入口 + iframe 例外） |
+
+```bash
+cd integrations/opencodex
+./apply.sh && ./apply_autoclaw.sh && ./apply_gui.sh
+ocx restart                  # 账号池不进运行时，必须重启
+ocx login workbuddy          # 浏览器授权；要加【另一个】账号就用无痕窗口打开打印的 URL
+ocx login autoclaw           # 手机验证码 / Google / Z.ai 三种方式
+ocx account list workbuddy   # 查看账号池
+```
+
+> ⚠️ **每次 `ocx update` 之后都要重跑这三个脚本。** opencodex 的自更新会整体替换 `src/`，补丁会被抹掉，
+> 表现为面板里 provider 消失、`ocx login workbuddy` 提示未知 provider。三个脚本都是**幂等**的，重复跑安全；
+> 每个都自带备份，`./apply.sh --revert` / `./apply_autoclaw.sh --revert` 可回滚。
+
+> ⚠️ **`./apply.sh --check` 的冒烟校验别跳过。** 它会真正加载模块并断言 `listOAuthProviders()` 含目标 provider ——
+> 「补丁文本在位、但注册没生效」（升级后常见的静默失败）只有这一步能抓到。
+
+内置化之后得到的能力：
+
+- **多账号池 + 自动切换**：复用 opencodex 的 `generic-account-failover.ts`，账号可在面板里直接增删
+- **后台 token 续期**：`token-guardian.ts` 定期刷新，无需人工干预
+- **AutoClaw 账号管理页**：<http://127.0.0.1:10100/autoclaw-accounts.html>
+  —— 手机验证码登录 / Google / Z.ai 网页 OAuth（含阿里云滑块），`/providers` 页右下角也有浮动入口
+- **额度显示**：provider 卡片上直接显示 WorkBuddy 积分余额 / AutoClaw 积分
+
+两个必踩的配置点：
+
+| 项 | 必须是 | 否则 |
+|---|---|---|
+| `autoclaw` 的 `baseUrl` | `http://0.0.0.0:7863/v1/autoclaw` | 写 `127.0.0.1` / `localhost` 会被 opencodex 判成「本地」provider → **账户 tab 根本不渲染**（`0.0.0.0` 同样可达本机端口，且不在它的 loopback 名单里） |
+| `autoclaw` 的 `authHeaderName` | `X-Authorization` | AutoClaw 网关不认 `Authorization` → 401 |
+
+> 补丁靠**锚点**定位 opencodex 源码。上游重构会让锚点失配，此时脚本会**显式报错并自动回滚**，不会写坏文件。
+> 已知 2.58.0 的漂移点：`OAUTH_PROVIDERS` 之后新增了 `DEPRECATED_OAUTH_PROVIDER_ALIASES` 块、
+> `providers/quota.ts` 拆包出 `quota/account-cache.ts` + `quota/report-cache.ts`、
+> `adapters/openai-chat.ts` 拆包出 `openai-chat/wire.ts`。脚本已改为**结构化定位**（花括号配对）以适配这类变化。
+> 若报「锚点匹配 0 次」，说明上游结构又变了，改锚点即可（脚本会指出是哪个文件）。
+
 ### 在 Dashboard 里改过 provider 后「模型全部消失」
 
 在 opencodex Dashboard 编辑过这个 provider 后，若模型列表整块变空（`ocx models live --provider workbuddy` 返回 `[]`、Codex 里也看不到），先查这两项：
@@ -394,23 +452,28 @@ ocx sync
 > `authMode` 的合法值是 `key` / `forward` / `oauth` / `local`（默认 `key`）。本项目是本机回环、无鉴权，**不要设 `oauth`**。
 > 在 Dashboard 里「隐藏模型」只会往 `disabledModels` 写一条 `workbuddy/<id>`，**不会影响其它模型**；隐藏某个模型后发现整块消失，一定是上面两项之一的配置问题。
 
-### 账号池能不能搬到 opencodex 里管？
+### 账号池放哪边管？
 
-opencodex 的「账号池」有两套机制，**只有内置 provider 能享受 OAuth 池**：
+opencodex 有两套池机制，**只有内置 provider 能享受 OAuth 池**：
 
 | | OAuth 池 | API-key 池 |
 |---|---|---|
-| 代表 | xai、google-antigravity、chatgpt | zai |
+| 代表 | xai、google-antigravity、chatgpt、**（经补丁内置化的）workbuddy / autoclaw** | zai |
 | 存储 | `~/.opencodex/auth.json`（含 `accounts[]`、额度窗口、priority） | `provider.apiKeyPool: [{id,key,label}]` |
 | 前提 | registry 里 `authKind: "oauth"` + 内置登录/刷新实现 | 任意 provider（含自定义） |
-| 自定义 provider | ❌ 做不到 | ✅ 可以：`printf '<key>' \| ocx account add-key workbuddy --label X` |
-| 轮转 | 按 priority / 额度 | 仅 **429** 触发 failover（冷却 60s，上限 10min） |
+| 自定义 provider | ❌ 默认做不到（需上一节的补丁把它变成内置 provider） | ✅ 可以：`printf '<key>' \| ocx account add-key workbuddy --label X` |
+| 轮转 | 按 priority / 额度 / 429 自动切换 | 仅 **429** 触发 failover（冷却 60s，上限 10min） |
 
-所以 `workbuddy` 只能做成 **API-key 池**，且它比本项目自带的池**弱**：不认积分、不粘会话、只在 429 时换 key。
-本项目自己的池有积分加权选择、粘性会话、失败冷却到次日 04:00、熔断指数退避 —— **轮转留在本项目更划算**，
-opencodex 只需把它当成一个 provider。
+两条路线怎么选：
 
-> 想让 opencodex 的 key 池真正驱动账号轮转，需要先给本项目加「每个账号一个 api key」的映射（key 钉住账号）。
+| 你的需求 | 建议 |
+|---|---|
+| 只想把额度接进 Codex CLI / Claude Code，顺带要个界面 | 用上面的 `ocx provider add`，一条命令 |
+| 想要多账号池、429 自动换号、在面板里直接管账号 | 跑 `integrations/opencodex/` 那三个脚本（见上一节）；代价是每次 `ocx update` 后要重跑 |
+
+> 本项目自带的池仍然更强一些：积分加权选择、粘性会话、失败冷却到次日 04:00、熔断指数退避。
+> 若你只用本项目、不需要 WebUI，**轮转留在本项目更划算**，opencodex 只当一个 provider 用即可。
+> 反过来，想让 opencodex 侧驱动本项目的账号轮转，需要先给本项目加「每个账号一个 api key」的映射（key 钉住账号）。
 > 另外 opencodex 内置的 `codebuddy-cn` provider 也支持 key 池，但它走 `codebuddy` **CLI 适配器**（`--tools ""`，
 > 不能带工具，需 `npm i -g @tencent-ai/codebuddy-code`），凭证是 `copilot.tencent.com/profile/keys` 的官方 API key ——
 > 与 desktop OAuth 会话不是同一套，不可混用。
