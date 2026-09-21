@@ -1,0 +1,34 @@
+{
+  "id": "qoder-global",
+  "label": "Qoder (Global)",
+  "authKind": "oauth",
+  "adapter": "openai-chat",
+  "baseUrl": "https://m4-pro.tailc81e73.ts.net:8443/v1/qoder/global",
+  "allowPrivateNetwork": true,
+  "keyOptional": true,
+  "preserveCustomDestination": true,
+  "staticHeaders": {
+    "User-Agent": "qodercli/1.0.0"
+  },
+  "defaultModel": "auto",
+  "models": [
+    "auto",
+    "ultimate",
+    "performance",
+    "efficient",
+    "lite",
+    "qmodel_38max",
+    "qmodel_latest",
+    "qmodel",
+    "qfmodel",
+    "kmodel_latest",
+    "kmodel",
+    "gmodel",
+    "gfmodel",
+    "dmodel",
+    "dfmodel",
+    "mmodel"
+  ],
+  "liveModels": false,
+  "note": "Qoder Global (qoder.com) via device-flow OAuth. Login proxies through the local workbuddy2api gateway (7863), which performs COSY signing + WAF body encoding + SSE unwrap upstream. Tokens live ~30 days; refresh is a no-op upstream (403) — re-login when expired."
+}

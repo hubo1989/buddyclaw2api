@@ -14,6 +14,7 @@ import (
 	"workbuddy2api/internal/autoclaw"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -29,7 +30,9 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	// Autoclaw 可选上游（nil = 未启用）：签到任务对其账号同样生效。
-	Autoclaw    *autoclaw.Subsystem
+	Autoclaw *autoclaw.Subsystem
+	// Qoder 可选上游（nil = 未启用）：每日活动观测（无签到机制，仅可领取提醒）。
+	Qoder       *qoder.Subsystem
 	SchoolHours []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours    []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
@@ -495,6 +498,26 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 				log.Printf("autoclaw checkin %s: +%d points (balance=%d)", r.Phone, r.Reward, r.Balance)
 			default:
 				log.Printf("autoclaw checkin %s: %s", r.Phone, r.Error)
+			}
+		}
+	}
+	// qoder 活动观测（无签到机制：claimable=true 时日志提醒人工领取）。
+	if s.cfg.Qoder != nil {
+		for _, r := range s.cfg.Qoder.RunCampaignCheck() {
+			switch {
+			case r.Err != "":
+				log.Printf("qoder campaign %s/%s: %s", r.Realm, r.UserID, r.Err)
+			case r.Claimable:
+				log.Printf("NOTICE: qoder campaign %s/%s 有可领取活动 (%d 项) %s —— 请到 qoder.com/qoder.cn 领取", r.Realm, r.UserID, r.Count, r.CampaignURL)
+			default:
+				log.Printf("qoder campaign %s/%s: 无活动", r.Realm, r.UserID)
+			}
+			if r.Err == "" {
+				if r.HasNumber {
+					log.Printf("qoder claim %s/%s: 名额有效 #%d（%s）—— 每日 Credits 附加包 +100", r.Realm, r.UserID, r.Number, r.NumberAt)
+				} else {
+					log.Printf("WARN: qoder claim %s/%s: 今日名额未持有 —— 请打开 Qoder 客户端领取", r.Realm, r.UserID)
+				}
 			}
 		}
 	}

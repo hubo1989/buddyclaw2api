@@ -20,6 +20,7 @@ import (
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -64,6 +65,12 @@ type Config struct {
 	AdminHost    string
 	// AdminPanelURL 账号管理页地址（need_captcha 引导用；空取默认 10100 面板页）。
 	AdminPanelURL string
+
+	// Qoder 可选上游（nil = 未启用）。CN/国际双域账号同池异域，聊天路由
+	// /v1/qoder/{realm}/chat/completions 按 realm 分流。
+	Qoder *qoder.Subsystem
+	// QoderAuthDir Qoder 账号落盘目录（空取默认 auths/）。
+	QoderAuthDir string
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -156,6 +163,18 @@ func NewHandler(cfg Config) *Handler {
 			Host:     cfg.AdminHost,
 			PanelURL: cfg.AdminPanelURL,
 		})
+	}
+	// Qoder 上游（nil = 未启用；启用后注册 /v1/qoder/{realm}/* + 管理端点）。
+	if cfg.Qoder != nil {
+		authDir := cfg.QoderAuthDir
+		if authDir == "" {
+			authDir = "auths"
+		}
+		h.cfg.QoderAuthDir = authDir
+		h.mux.HandleFunc("POST /v1/qoder/{realm}/chat/completions", h.qoderChat)
+		if cfg.EnableAdmin {
+			h.RegisterQoderAdminRoutes()
+		}
 	}
 	return h
 }

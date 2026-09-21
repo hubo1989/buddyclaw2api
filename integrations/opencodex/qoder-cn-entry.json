@@ -1,0 +1,35 @@
+{
+  "id": "qoder-cn-oauth",
+  "label": "Qoder (CN, OAuth)",
+  "authKind": "oauth",
+  "adapter": "openai-chat",
+  "baseUrl": "https://m4-pro.tailc81e73.ts.net:8443/v1/qoder/cn",
+  "allowPrivateNetwork": true,
+  "keyOptional": true,
+  "preserveCustomDestination": true,
+  "staticHeaders": {
+    "User-Agent": "qodercn/1.0.0"
+  },
+  "defaultModel": "auto",
+  "models": [
+    "auto",
+    "ultimate",
+    "performance",
+    "efficient",
+    "lite",
+    "qmodel_38max",
+    "qmodel_latest",
+    "qmodel",
+    "qfmodel",
+    "kmodel_latest",
+    "kmodel",
+    "gmodel",
+    "gfmodel",
+    "dmodel",
+    "dfmodel",
+    "mmodel"
+  ],
+  "liveModels": false,
+  "note": "Qoder CN (qoder.cn, Alibaba Cloud deployment, independent account system). Login lands on qoder.cn device page via the local gateway; chat proxies through 7863 like qoder-global. CN direct-inference endpoints are not publicly verified yet — the gateway fails fast unless QODER_CN_CHAT_BASE is configured.",
+  "experimental": true
+}

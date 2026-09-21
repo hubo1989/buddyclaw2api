@@ -735,9 +735,9 @@ func TestModelsDevNegativesReStampBlocksEviction(t *testing.T) {
 // model.json 不可复现覆盖）。
 func TestParseModelsDevDocTieBreakDeterministic(t *testing.T) {
 	raw := fakeModelsDevDoc(map[string]map[string][2]int64{
-		"agg-a": {"kimi-k3": {1000000, 131072}},
-		"agg-b": {"kimi-k3": {1000000, 131072}},
-		"agg-c": {"kimi-k3": {1000000, 131072}},
+		"agg-a":    {"kimi-k3": {1000000, 131072}},
+		"agg-b":    {"kimi-k3": {1000000, 131072}},
+		"agg-c":    {"kimi-k3": {1000000, 131072}},
 		"z-vendor": {"kimi-k3": {200000, 131072}},
 		"y-vendor": {"kimi-k3": {200000, 131072}},
 		"a-vendor": {"kimi-k3": {200000, 131072}},
@@ -762,7 +762,7 @@ func TestParseModelsDevDocTieBreakDeterministic(t *testing.T) {
 }
 
 // TestParseModelsDevDocVendorTieBreakByProviderName T1 多官方源同票分歧
-//（zai 与 moonshotai 都报 kimi-k3 且值不同）：两候选都 vendor=true 同票，
+// （zai 与 moonshotai 都报 kimi-k3 且值不同）：两候选都 vendor=true 同票，
 // 旧实现「先到先得」不确定，必须由 provider 字典序（moonshotai < zai）收敛。
 func TestParseModelsDevDocVendorTieBreakByProviderName(t *testing.T) {
 	raw := fakeModelsDevDoc(map[string]map[string][2]int64{

@@ -426,13 +426,13 @@ func TestReasoningContentSanitized(t *testing.T) {
 // TestSanitize 全族回归，方可同步更新本快照。
 func TestSanitizeLiteralByteExact(t *testing.T) {
 	features := []string{
-		"x-anthropic-billing-header", // header 键值段键名
-		"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
-		"You are Claude Code",        // 身份句（截断前缀即可命中）
-		"Main branch (",              // 注入指令句（截断前缀即可命中）
+		"x-anthropic-billing-header",                      // header 键值段键名
+		"cc_entrypoint=",                                  // 尾随裸键值（截断前缀即可命中）
+		"You are Claude Code",                             // 身份句（截断前缀即可命中）
+		"Main branch (",                                   // 注入指令句（截断前缀即可命中）
 		"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
-		"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
-		"11128",                      // 上游反探测：裸数字错误码
+		"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+		"11128",                                           // 上游反探测：裸数字错误码
 	}
 	if len(sanitizeFeatures) != len(features) {
 		t.Fatalf("sanitizeFeatures 项数=%d want %d（快照与实现不同步，见测试头注释的验证步骤）", len(sanitizeFeatures), len(features))

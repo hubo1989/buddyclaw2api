@@ -62,6 +62,12 @@ type Config struct {
 	AutoclawBreakerDur  time.Duration `json:"-"`
 	AutoclawBreakerMax  time.Duration `json:"-"`
 
+	Qoder struct {
+		Enabled        bool   `json:"enabled"`         // 默认 false，零影响
+		AuthDir        string `json:"auth_dir"`        // 默认同顶层 auth_dir（qoder-*.json）
+		TimeoutSeconds int    `json:"timeout_seconds"` // 上游 HTTP 超时，默认 120
+	} `json:"qoder"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。

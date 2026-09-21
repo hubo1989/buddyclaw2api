@@ -6,16 +6,14 @@
     id: "autoclaw",
     label: "AutoClaw (Zhipu)",
     adapter: "openai-chat",
-    // 指向本机 workbuddy2api 的带外转发端点，而不是直连上游：
-    // AutoClaw 的 token 与 host 绑定（手机号账号在国内 host、z.ai/Google 账号在国际 host），
-    // 而 provider 只有一个 baseUrl —— 由 7863 按 token 自动挑 host。
-    // 端点路径 = ${baseUrl}/chat/completions。
-    // ⚠️ 必须用 0.0.0.0 而不是 127.0.0.1/localhost：opencodex 把 loopback baseUrl 判为
-    // 「本地」provider（vi()/si()：hostname ∈ {localhost,127.0.0.1,::1}），后果是
-    // 「本地」徽标 + 账户 tab 不渲染（qa() 对 local/loopback 返回 null）。0.0.0.0 在
-    // macOS/Linux 上同样可达本机端口，但不在该名单里。
-    baseUrl: "http://0.0.0.0:7863/v1/autoclaw",
-    // 回环地址 + 本机 fake-IP 环境，需要放行私有网络。
+    // 指向本机 workbuddy2api 的带外转发端点（经 tailscale 域名，tailnet 内可达），
+    // 而不是直连上游：AutoClaw 的 token 与 host 绑定（手机号账号在国内 host、
+    // z.ai/Google 账号在国际 host），而 provider 只有一个 baseUrl —— 由 7863 按
+    // token 自动挑 host。端点路径 = ${baseUrl}/chat/completions。
+    // ⚠️ 不能用 0.0.0.0：新版 opencodex 目标策略把 unspecified 地址判死；
+    // 127.0.0.1/localhost 虽可行但会打「本地」徽标。tailscale 域名解析到
+    // tailnet IP（100.64/10，private 类），allowPrivateNetwork:true 放行且无徽标。
+    baseUrl: "https://m4-pro.tailc81e73.ts.net:8443/v1/autoclaw",
     allowPrivateNetwork: true,
     authKind: "oauth",
     preserveCustomDestination: true,

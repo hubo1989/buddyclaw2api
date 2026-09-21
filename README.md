@@ -385,6 +385,62 @@ curl http://127.0.0.1:7863/v1/chat/completions \
 - **错误处理**：401 → 自动刷新重试一次，仍失败标记 `needs_relogin`（`/status` 可见，需重新运行登录命令）；429 → 60s 软冷却；积分不足 → 冷却到次日 04:00；非法模型 → 400 原样透传。
 - **协议来源**：AutoClaw.app 1.18.1 客户端逆向 + 实测（详见 `docs/specs/2026-09-11-autoclaw-provider.md`）。**非官方 API**，客户端版本升级可能导致协议漂移（签名/端点/模型白名单变化），届时需更新 `internal/autoclaw` 的常量。
 
+## Qoder 上游（可选）
+
+第三上游：阿里 [Qoder](https://qoder.com)（AI IDE）的 **CN（qoder.cn）与国际版（qoder.com）双域**账号。
+`model` 以 `qoder/<realm>/<key>` 形式路由（realm 为 `cn`/`global`），与 WorkBuddy/AutoClaw 池互不影响。
+协议直连实现移植自 9router（github.com/decolua/9router，MIT）：COSY 混合签名（RSA+AES+MD5，17 个 Cosy-* 头）、
+WAF-bypass body 编码、`{statusCodeValue, body}` SSE 信封解包，全部在网关侧完成——外部调用方只看到标准 OpenAI 协议。
+
+### 启用步骤
+
+```bash
+# 1. 编译登录工具
+go build -o wb2api-qoder-login ./cmd/qoder-login
+
+# 2a. 设备流登录（浏览器授权；token 约 30 天）
+./wb2api-qoder-login device --realm=global        # 国际版 qoder.com
+./wb2api-qoder-login device --realm=cn            # 国内版 qoder.cn（独立账号体系）
+
+# 2b. 或 PAT 导入（qoder.com / qoder.cn → Account → Integrations，pt- 前缀）
+./wb2api-qoder-login pat --realm=global --token=pt-xxxx
+
+# 3. 配置启用（config.json）
+#   { "qoder": { "enabled": true } }
+./service.sh restart
+
+# 4. 使用（Authorization 带登录落盘的 access token，网关按 token 查池签名）
+curl http://127.0.0.1:7863/v1/qoder/global/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dt-xxxx' \
+  -d '{"model":"qoder/global/auto","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+### 模型列表
+
+| 模型 | 说明 |
+|---|---|
+| `auto` / `ultimate` / `performance` / `efficient` / `lite` | 档位路由 |
+| `qmodel_38max` / `qmodel_latest` / `qmodel` / `qfmodel` | Qwen 系列 |
+| `kmodel_latest` / `kmodel` | Kimi 系列 |
+| `gmodel` / `gfmodel` | GLM 系列 |
+| `dmodel` / `dfmodel` | DeepSeek 系列 |
+| `mmodel` | MiniMax |
+
+### 行为说明
+
+- **双域分池**：CN 与国际版是独立部署（服务器/账号体系均不同），登录与账号池按 realm 隔离，聊天路由 `/v1/qoder/{realm}/chat/completions` 按路径分流。
+- **token 不可刷新**：设备流 token 约 30 天有效，上游 refresh 端点对设备流实测 403（9router 同口径）——过期后重新登录即可；PAT 导入的 job token（jt-）约 24h，由网关按需重换。
+- **jt- 走备用域**：国际版推理域 api3.qoder.sh 拒绝 jt- token（"Login expired"），网关自动切 api2.qoder.sh；dt- 设备 token 固定走 api3。
+- **model_config 必须先拉目录**：`model_config` 发错上游会**静默降级到别的模型**，网关按账号 COSY 签名拉取 `/algo/api/v2/model/list`（缓存 1h），缺失即硬报错不猜测。
+- **CN 端点（qoderclicn 1.1.58 二进制提取核实）**：登录/轮询走 `openapi.qoder.com.cn`（登录 URL 另带 `client_id`），推理走 `gateway.qoder.com.cn/model/v1/chat/completions`——标准 OpenAI 形态、bearer 鉴权、无 COSY/Encode。注意：gateway 域对无认证流量返回 ALB 503，需真实账号 token 实测确认；域名可用 `QODER_CN_OPENAPI_BASE` / `QODER_CN_CHAT_BASE` / `QODER_CN_LOGIN_PAGE` 覆盖。
+- **协议来源**：9router open-sse/shared/qoder/*（其源自 CLIProxyAPIPlus qoder-provider 分支并与 live qodercli 流量核对）+ qoder-shim 对 CN 官方 API 的实测记录。**非官方 API**，客户端版本升级可能导致协议漂移（RSA 公钥/签名头/端点变化），届时需更新 `internal/qoder` 的常量。
+
+> 想把 Qoder 接进 Codex CLI / Claude Code，或在 opencodex 面板里直接登录管理：先
+> `./integrations/opencodex/apply_qoder.sh` 打补丁并 `ocx restart`，面板即出现
+> `qoder-global` 与 `qoder-cn-oauth` 两个 OAuth provider（opencodex 上游另有内置
+> `qoder`/`qoder-cn` 为官方 CLI 包装型 key provider，与我们互不冲突）。登录与对话均经网关 7863 代理。
+
 > 想把 `autoclaw/*` 模型接进 Codex CLI / Claude Code，或在 opencodex 面板里直接管理 AutoClaw 账号池，
 > 见下文「接入 opencodex」中的 **把 workbuddy / autoclaw 内置进 opencodex** 一节。
 
