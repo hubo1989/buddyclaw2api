@@ -35,9 +35,9 @@ func TestModelCostPersistRoundTrip(t *testing.T) {
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.NoteModelCost("u1", "hy4-preview", 0, 1000)   // 免费（tier 0）
-	p.NoteModelCost("u1", "glm-5.3", 2.0, 1000)     // 收费（tier 2）
-	p.NoteModelCost("u1", "glm-5.3", 4.0, 1000)     // 二次观测（EMA + Samples）
+	p.NoteModelCost("u1", "hy4-preview", 0, 1000) // 免费（tier 0）
+	p.NoteModelCost("u1", "glm-5.3", 2.0, 1000)   // 收费（tier 2）
+	p.NoteModelCost("u1", "glm-5.3", 4.0, 1000)   // 二次观测（EMA + Samples）
 	p.Flush()
 
 	p2 := New(fp)
@@ -95,7 +95,7 @@ func TestModelCostPersistTTLExpiryFilter(t *testing.T) {
 }
 
 // TestModelCostPersistExpiryNotWritten 落盘侧惰性清理：已过期的条目不写出
-//（落盘即清理，与恢复侧同口径），state.json 不残留陈旧价格。
+// （落盘即清理，与恢复侧同口径），state.json 不残留陈旧价格。
 func TestModelCostPersistExpiryNotWritten(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
@@ -172,9 +172,9 @@ func TestModelCostRestoreDropsInvalid(t *testing.T) {
 			"u1": map[string]any{
 				"credits": 100,
 				"model_costs": map[string]any{
-					"valid":   map[string]any{"cost_per_1k": 1.5, "last_seen": time.Now().Format(time.RFC3339Nano), "samples": 3},
-					"neg":     map[string]any{"cost_per_1k": negative, "last_seen": time.Now().Format(time.RFC3339Nano)},
-					"nolast":  map[string]any{"cost_per_1k": 2.0},
+					"valid":  map[string]any{"cost_per_1k": 1.5, "last_seen": time.Now().Format(time.RFC3339Nano), "samples": 3},
+					"neg":    map[string]any{"cost_per_1k": negative, "last_seen": time.Now().Format(time.RFC3339Nano)},
+					"nolast": map[string]any{"cost_per_1k": 2.0},
 				},
 			},
 		},

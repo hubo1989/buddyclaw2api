@@ -4,10 +4,13 @@
 set -e
 cd "$(dirname "$0")"
 
+# go 未必在 PATH 里（macOS 上 brew 装的 go 常缺 shellenv），由 goenv.sh 兜底定位。
+source "./scripts/goenv.sh"
 BIN=./signin_bin
 if [ ! -x "$BIN" ]; then
     echo "build signin_bin ..."
-    go build -o "$BIN" ./cmd/signin
+    require_go || exit 1
+    "$GO_BIN" build -o "$BIN" ./cmd/signin
 fi
 
 exec "$BIN" "${1:-auths}"

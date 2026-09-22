@@ -518,6 +518,47 @@ func TestBadSessionTTL(t *testing.T) {
 	}
 }
 
+func TestValidateForServe(t *testing.T) {
+	cases := []struct {
+		name    string
+		listen  string
+		apiKey  string
+		allow   bool // 设置 WB2A_ALLOW_INSECURE_LISTEN=1 显式放行
+		wantErr bool
+	}{
+		{"非回环 + 有 key 放行", ":7863", "k", false, false},
+		{"回环 + 空 key 仅告警", "127.0.0.1:7863", "", false, false},
+		{"localhost + 空 key 仅告警", "localhost:7863", "", false, false},
+		{"IPv6 回环 + 空 key 仅告警", "[::1]:7863", "", false, false},
+		{"全网卡 + 空 key 拒绝", ":7863", "", false, true},
+		{"0.0.0.0 + 空 key 拒绝", "0.0.0.0:7863", "", false, true},
+		{"全网卡 + 空 key 但显式放行", ":7863", "", true, false},
+		// 示例占位值视同未设置：cp config.example.json 后忘记改也应被拦住。
+		{"全网卡 + 占位值拒绝", ":7863", "your-api-key-here", false, true},
+		{"全网卡 + README 占位值拒绝", ":7863", "your-api-key", false, true},
+		{"回环 + 占位值仅告警", "127.0.0.1:7863", "changeme", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.allow {
+				t.Setenv("WB2A_ALLOW_INSECURE_LISTEN", "1")
+			} else {
+				t.Setenv("WB2A_ALLOW_INSECURE_LISTEN", "")
+			}
+			c := Default()
+			c.Listen = tc.listen
+			c.APIKey = tc.apiKey
+			err := c.ValidateForServe()
+			if tc.wantErr && err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 // TestMaxBodyLegacyKeyIgnored max_body_mb 已移除（BREAKING）：旧配置文件里仍带该键
 // （含非法值形态 0/-1 与 server 段整体存在）必须解析成功、启动不报错——字段已删，
 // JSON 未知键天然忽略（非 DisallowUnknownFields 严格模式），无 deprecation 噪音。

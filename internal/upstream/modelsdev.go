@@ -260,12 +260,12 @@ func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 
 // parseModelsDevDoc 解析 models.dev api.json：{provider:{models:{id:{limit:{context,
 // output}}}}} → 裸 id 索引。同名多 provider 采值优先级四级：官方 vendor 源
-//（modelsDevVendorSources）> 票数众数 > provider 字典序 > 先出现。
+// （modelsDevVendorSources）> 票数众数 > provider 字典序 > 先出现。
 // 第 3 级 provider 字典序是确定性 tie-break：聚合时维护候选的最小 provider 名
-//（minProvider，同 doc 稳定的选择器身份），消灭 map 迭代序随机化导致的
-//「同票先到先得」值抖动（同 binary 两次拉取同一文档可能落不同的值进 model.json，
+// （minProvider，同 doc 稳定的选择器身份），消灭 map 迭代序随机化导致的
+// 「同票先到先得」值抖动（同 binary 两次拉取同一文档可能落不同的值进 model.json，
 // /v1/models 的 context_length 不可复现）。不引入「值字典序」——那会把
-//「选谁」变成「选什么值」的启发式，语义不如 provider 名干净。
+// 「选谁」变成「选什么值」的启发式，语义不如 provider 名干净。
 func parseModelsDevDoc(raw []byte) (map[string]modelsDevEntry, error) {
 	var doc map[string]struct {
 		Models map[string]struct {

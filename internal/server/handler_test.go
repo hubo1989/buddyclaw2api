@@ -890,6 +890,8 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	if st.Until.Hour() != 4 {
 		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
 	}
+	// 时长 = 28h - 当前时刻，范围 (4h, 28h]（本地 00:00~04:00 之间必然 >24h）。
+
 	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
 	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
 		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
@@ -1448,6 +1450,38 @@ func TestAPIKeyAuth(t *testing.T) {
 	}
 }
 
+func TestAPIKeyAuthConstantTimeEdgeCases(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+	})
+	cases := []struct {
+		authz string
+		want  int
+	}{
+		{"", 401},               // 完全没带 header
+		{"secret", 401},         // 缺 "Bearer " 前缀
+		{"Bearer", 401},         // 前缀不完整
+		{"Bearer ", 401},        // 空 token
+		{"Bearer secre", 401},   // 前缀匹配但长度不足
+		{"Bearer secretX", 401}, // 多一字节
+		{"bearer secret", 401},  // 前缀大小写敏感
+		{"Bearer secret", 200},  // 正确
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest("GET", "/v1/models", nil)
+		if tc.authz != "" {
+			req.Header.Set("Authorization", tc.authz)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("authz=%q: code=%d want %d", tc.authz, rec.Code, tc.want)
+		}
+	}
+}
+
 // TestAPIKeyAuthConstantTime Bearer 比较的边界回归（P2-8，发现 7）：
 // 正确 key 通过；错误/空/前缀相同但长度不同一律 401。
 // 常量时间属性（subtle.ConstantTimeCompare）本身无法用单元测试观测，
@@ -1460,7 +1494,7 @@ func TestAPIKeyAuthConstantTime(t *testing.T) {
 	})
 	cases := []struct {
 		name string
-		bear string // 完整 Authorization 头（不含 "Bearer " 前缀则按原样发）
+		bear string
 		want int
 	}{
 		{"correct key", "secret", 200},
@@ -1475,8 +1509,6 @@ func TestAPIKeyAuthConstantTime(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer "+c.bear)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
-			// 正确 key 会继续打到上游（GET /v1/models 走静态表 → 200）；
-			// 其余必须被 401 挡在鉴权层。
 			if rec.Code != c.want {
 				t.Errorf("Bearer %q: code=%d want %d", c.bear, rec.Code, c.want)
 			}
@@ -2425,7 +2457,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 }
 
 // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
-//（pr134-watchlist-analysis.md #10）：
+// （pr134-watchlist-analysis.md #10）：
 // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
 // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
 // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定

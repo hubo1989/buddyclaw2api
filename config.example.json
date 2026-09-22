@@ -84,5 +84,16 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "autoclaw": {
+    "enabled": false,
+    "host": "https://autoglm-api.autoglm.ai",
+    "auth_dir": "",
+    "timeout_seconds": 120,
+    "refresh_skew": "30m",
+    "soft_rate": "60s",
+    "breaker_threshold": 3,
+    "breaker_cooldown": "1m",
+    "breaker_cooldown_max": "30m"
   }
 }

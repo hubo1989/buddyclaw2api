@@ -71,12 +71,15 @@ elif command -v xsel &>/dev/null; then
     echo -n "$AUTH_URL" | xsel --clipboard 2>/dev/null && echo "(已复制到剪贴板)"
 fi
 
-echo ""
-read -rp "完成登录后按 y 继续: " ans
-if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
-    echo "已取消"
-    exit 1
+# macOS 自动打开浏览器（Linux 无 xdg-open 时保持手动复制）
+if command -v open &>/dev/null; then
+    open "$AUTH_URL" && echo "(已自动打开浏览器)"
+elif command -v xdg-open &>/dev/null; then
+    xdg-open "$AUTH_URL" 2>/dev/null && echo "(已自动打开浏览器)"
 fi
+
+echo ""
+echo "等待浏览器完成登录（自动轮询，最长 5 分钟，无需按键）..."
 
 echo ""
 echo "正在获取 token..."
@@ -106,54 +109,6 @@ EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
 # OAuth 返回字段一律通过环境变量传入 Python，并使用带引号 heredoc：
 # 昵称/domain/token 等值可含引号或换行，不得拼进 Python 源码。
-
-# ─── 签到（仅 CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞。
-#      global realm 跳过——国际版计费端点与签到端点未实测，避免误打 CN 端点）───
-if [[ "$REALM" == "global" ]]; then
-    echo "签到: global realm 跳过（国际版签到端点未实测）"
-else
-WB2A_LOGIN_TOKEN="$TOKEN" \
-WB2A_LOGIN_USER_ID="$USER_ID" \
-WB2A_LOGIN_ENT_ID="$ENT_ID" \
-WB2A_LOGIN_DOMAIN="$DOMAIN" \
-python3 - <<'PYEOF'
-import json, os, urllib.request, urllib.error
-
-token = os.environ["WB2A_LOGIN_TOKEN"]
-user_id = os.environ["WB2A_LOGIN_USER_ID"]
-enterprise_id = os.environ["WB2A_LOGIN_ENT_ID"]
-domain = os.environ["WB2A_LOGIN_DOMAIN"]
-
-req = urllib.request.Request(
-    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
-    method="POST", data=b"{}",
-    headers={
-        "Authorization": "Bearer " + token,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-User-Id": user_id,
-        **({"X-Enterprise-Id": enterprise_id, "X-Tenant-Id": enterprise_id} if enterprise_id else {}),
-        **({"X-Domain": domain} if domain else {}),
-    })
-try:
-    with urllib.request.urlopen(req, timeout=15) as r:
-        body = json.loads(r.read().decode() or "{}")
-    if body.get("code") == 0:
-        data = body.get("data") or {}
-        print(f"签到: 成功 {json.dumps(data, ensure_ascii=False)[:150]}")
-    else:
-        print(f"签到: {body.get('msg', json.dumps(body)[:150])}")
-except urllib.error.HTTPError as e:
-    # 已签到等业务错误也走 4xx（实测 code=10001 "今天已签到"）
-    try:
-        body = json.loads(e.read().decode() or "{}")
-        print(f"签到: {body.get('msg', 'http %d' % e.code)}")
-    except Exception:
-        print(f"签到: http {e.code}")
-except Exception as e:
-    print(f"签到: {e}")
-PYEOF
-fi
 
 # ─── 落盘 auth 文件（与 internal/auth 读取格式一致）─────────────────
 AUTH_FILE="$AUTH_DIR/workbuddy-${USER_ID}.json"
@@ -224,6 +179,52 @@ except Exception:
 print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_file}")
 PYEOF
 
+# ─── 签到（仅 CN；凭证已落盘，签到失败不阻塞、不丢 token）────────────
+if [[ "$REALM" == "global" ]]; then
+    echo "签到: global realm 跳过（国际版签到端点未实测）"
+else
+WB2A_LOGIN_TOKEN="$TOKEN" \
+WB2A_LOGIN_USER_ID="$USER_ID" \
+WB2A_LOGIN_ENT_ID="$ENT_ID" \
+WB2A_LOGIN_DOMAIN="$DOMAIN" \
+python3 - <<'PYEOF'
+import json, os, urllib.request, urllib.error
+
+token = os.environ["WB2A_LOGIN_TOKEN"]
+user_id = os.environ["WB2A_LOGIN_USER_ID"]
+enterprise_id = os.environ["WB2A_LOGIN_ENT_ID"]
+domain = os.environ["WB2A_LOGIN_DOMAIN"]
+
+req = urllib.request.Request(
+    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+    method="POST", data=b"{}",
+    headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-User-Id": user_id,
+        **({"X-Enterprise-Id": enterprise_id, "X-Tenant-Id": enterprise_id} if enterprise_id else {}),
+        **({"X-Domain": domain} if domain else {}),
+    })
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = json.loads(r.read().decode() or "{}")
+    if body.get("code") == 0:
+        data = body.get("data") or {}
+        print(f"签到: 成功 {json.dumps(data, ensure_ascii=False)[:150]}")
+    else:
+        print(f"签到: {body.get('msg', json.dumps(body)[:150])}")
+except urllib.error.HTTPError as e:
+    # 已签到等业务错误也走 4xx（实测 code=10001 "今天已签到"）
+    try:
+        body = json.loads(e.read().decode() or "{}")
+        print(f"签到: {body.get('msg', 'http %d' % e.code)}")
+    except Exception:
+        print(f"签到: http {e.code}")
+except Exception as e:
+    print(f"签到: {e}")
+PYEOF
+fi
 # ─── 国际版注册激活 + trial 领取（仅 global；token 已落盘，失败只提示不阻断）──────
 #
 # 根因（ANALYSIS-workbuddy-client-reverse.md）：新 global 账号需先完善注册地区

@@ -20,6 +20,12 @@ data/
 # Config with secrets (use config.example.json)
 config.json
 
+# autoclaw 手机验证码登录 CLI 的构建产物（用 build 脚本重新生成，标的是产物不是源码）
+/wb2api-autoclaw-login
+
+# oh-my-Codex 会话/运行态缓存（本地状态，不进版本库）
+/.omo/
+
 # Build artifacts
 *.tmp
 __pycache__/
@@ -31,6 +37,7 @@ __pycache__/
 .server.pid
 wb2api.pid
 *.log
+/logs/
 draft_*_folder/
 
 # Backups (contains auth tokens)

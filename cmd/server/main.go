@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/autoclaw"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/qoder"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -37,14 +40,21 @@ func main() {
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
-		// 配置文件不存在时给一次机会用纯默认 + env
-		if os.IsNotExist(err) {
+		// 配置文件不存在时给一次机会用纯默认 + env。
+		// 必须用 errors.Is 解包——Load 内部用 %w 包装了 os 错误，
+		// os.IsNotExist 不解包，会让本分支永远不成立（死代码）。
+		if errors.Is(err, os.ErrNotExist) {
 			log.Printf("config %s not found, using defaults+env", *cfgPath)
 			cfg, err = Load("")
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
+	}
+
+	// 安全闸门：空 key + 非回环监听直接拒绝启动，避免无鉴权暴露。
+	if err := cfg.ValidateForServe(); err != nil {
+		log.Fatalf("unsafe config: %v", err)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -115,6 +125,68 @@ func main() {
 		return 0
 	}
 
+	// autoclaw 上游（默认关闭；启用时从 auth 目录加载 autoclaw-*.json）。
+	var acSub *autoclaw.Subsystem
+	adminAuthDir := ""
+	if cfg.Autoclaw.Enabled {
+		acDir := cfg.Autoclaw.AuthDir
+		if acDir == "" {
+			acDir = cfg.AuthDir
+		}
+		adminAuthDir = acDir
+		acCreds, err := autoclaw.LoadDir(acDir)
+		if err != nil {
+			log.Fatalf("load autoclaw auths: %v", err)
+		}
+		if len(acCreds) == 0 {
+			log.Printf("WARN: autoclaw.enabled 但 %s 下无 autoclaw-*.json — "+
+				"先运行 wb2api-autoclaw-login -phone <手机号> 登录（账号须服务独占，勿与桌面端同号）", acDir)
+		} else {
+			for _, c := range acCreds {
+				log.Printf("autoclaw account: uid=%s phone=%s", c.UID, autoclaw.MaskPhoneExport(c.Phone))
+			}
+		}
+		acSub = autoclaw.NewSubsystem(autoclaw.SubsystemConfig{
+			Host:             cfg.Autoclaw.Host,
+			Timeout:          time.Duration(cfg.Autoclaw.TimeoutSeconds) * time.Second,
+			RefreshSkew:      cfg.AutoclawRefreshSkew,
+			SoftCooldown:     cfg.AutoclawSoftDur,
+			BreakerThreshold: cfg.Autoclaw.BreakerThreshold,
+			BreakerCooldown:  cfg.AutoclawBreakerDur,
+			BreakerMax:       cfg.AutoclawBreakerMax,
+		}, acCreds)
+		log.Printf("autoclaw upstream enabled: %d account(s)", acSub.Count())
+	}
+
+	// qoder 上游（默认关闭；启用时从 auth 目录加载 qoder-*.json，CN/global 双域同池异域）。
+	var qSub *qoder.Subsystem
+	qoderAuthDir := ""
+	if cfg.Qoder.Enabled {
+		qDir := cfg.Qoder.AuthDir
+		if qDir == "" {
+			qDir = cfg.AuthDir
+		}
+		qoderAuthDir = qDir
+		qCreds, err := qoder.LoadDir(qDir)
+		if err != nil {
+			log.Fatalf("load qoder auths: %v", err)
+		}
+		if len(qCreds) == 0 {
+			log.Printf("WARN: qoder.enabled 但 %s 下无 qoder-*.json — "+
+				"先经面板登录或运行 qoder-login 导入账号", qDir)
+		} else {
+			for _, c := range qCreds {
+				log.Printf("qoder account: realm=%s uid=%s method=%s", c.Realm, c.UserID, c.AuthMethod)
+			}
+		}
+		timeout := time.Duration(cfg.Qoder.TimeoutSeconds) * time.Second
+		if cfg.Qoder.TimeoutSeconds <= 0 {
+			timeout = 120 * time.Second
+		}
+		qSub = qoder.NewSubsystem(qoder.SubsystemConfig{Timeout: timeout}, qCreds)
+		log.Printf("qoder upstream enabled: %d account(s)", qSub.Count())
+	}
+
 	up := upstream.New()
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -161,6 +233,8 @@ func main() {
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		CatDisabled:         !cfg.Schedule.CatEnabled,
+		Autoclaw:            acSub,
+		Qoder:               qSub,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -210,6 +284,17 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// autoclaw 子系统（nil = 未启用；启用后注册 /v1/autoclaw/* 路由 + 管理端点）。
+		Autoclaw: acSub,
+		// 管理端点开关：autoclaw 或 qoder 任一启用即开（内部注册仍按各自子系统
+		// 非 nil 二次把关，互不泄漏）。
+		EnableAdmin:   acSub != nil || qSub != nil,
+		AdminAuthDir:  adminAuthDir,
+		AdminHost:     cfg.Autoclaw.Host,
+		AdminPanelURL: os.Getenv("WB2A_ADMIN_PANEL_URL"),
+		// qoder 子系统（nil = 未启用；启用后注册 /v1/qoder/{realm}/* + 管理端点）。
+		Qoder:        qSub,
+		QoderAuthDir: qoderAuthDir,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

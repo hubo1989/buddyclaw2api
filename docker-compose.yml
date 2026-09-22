@@ -6,6 +6,8 @@ services:
     environment:
       - TZ=Asia/Shanghai
     ports:
+      # 对外暴露到所有网卡。应用层有启动闸门（api_key 为空/占位值时拒绝启动），
+      # 但如需进一步收紧、只允许本机访问，改成 "127.0.0.1:7863:7863"。
       - "7863:7863"
     volumes:
       # auths 凭证卷：login.sh 在宿主机落盘 workbuddy-<uid>.json（0600），容器网关以

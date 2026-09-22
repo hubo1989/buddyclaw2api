@@ -27,6 +27,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -246,13 +247,35 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	}
 	headers := commonHeaders(origin)
 	// handlePollLogin：auth/token 是权威登录状态端点，
-	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
-	if errTok != nil {
-		if status == 0 || status >= 500 {
-			fatal("token endpoint error: %v", errTok)
+	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle。
+	//
+	// 必须轮询而不是单次请求：登录完成发生在浏览器侧，时机不可控——只请求一次时，
+	// "用户在浏览器点完授权"与"poll 发起"只要有一点不同步就会误判失败（实测曾连续
+	// 4 个账号卡在这一步、一份凭证都没落盘，事后补 poll 同一 state 却一次成功）。
+	// 每次间隔 2s，默认最长 5 分钟；LOGIN_POLL_TIMEOUT（秒）可覆盖。进度写 stderr，
+	// stdout 保持"仅最终 JSON"的契约不变。
+	timeout := 5 * time.Minute
+	if v := os.Getenv("LOGIN_POLL_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			timeout = time.Duration(n) * time.Second
 		}
-		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+	}
+	var tokRaw json.RawMessage
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		var errTok error
+		tokRaw, _, errTok = doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
+		if errTok == nil {
+			break
+		}
+		if time.Since(start) >= timeout {
+			fatal("等待登录超时（已等 %s，共尝试 %d 次），最后一次错误：%v\n"+
+				"  请在浏览器完成登录后重跑", timeout, attempt, errTok)
+		}
+		if attempt == 1 || attempt%5 == 0 {
+			fmt.Fprintf(os.Stderr, "  等待浏览器完成登录… %ds\n", int(time.Since(start).Seconds()))
+		}
+		time.Sleep(2 * time.Second)
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`

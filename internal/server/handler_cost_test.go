@@ -204,7 +204,7 @@ func TestRotationPreservesFullContext(t *testing.T) {
 
 // TestStatusModelCostsLedger end-to-end（P1-anti-monopoly 可观测性）：成功请求
 // 记入成本账本后，GET /status 的 accounts[].model_costs 透出台账——每模型一行
-//（model/cost_per_1k/last_seen/samples），免费观测 per1k=0、收费观测 per1k>0，
+// （model/cost_per_1k/last_seen/samples），免费观测 per1k=0、收费观测 per1k>0，
 // 无观测账号该字段为空。
 func TestStatusModelCostsLedger(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
