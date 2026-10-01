@@ -248,7 +248,8 @@ type LimitedNumberResult struct {
 	CreatedAt string `json:"createdAt"`
 }
 
-// LimitedNumber 查询/领取每日限量名额（app 端「每天领 100」入口即轮询此端点）。
+// LimitedNumber 查询每日限量名额状态（app 端「每天领 100」入口即轮询此端点）。
+// 该 GET 不执行领取写操作；名额 add-on 由服务端按日发放。
 const (
 	CampaignPath        = "/sash/api/v1/me/campaigns"
 	CampaignLimitedPath = "/sash/api/v1/me/campaigns/client_launch_26/limited-number"

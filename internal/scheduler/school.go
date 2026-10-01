@@ -15,12 +15,18 @@ import (
 )
 
 // repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
-// 策略：从当前工作目录逐级向上找 scripts/school_open_day_2026.py，
+// 策略：优先 WB2A_ROOT（LaunchAgent 二进制不在仓库目录运行时使用），
+// 否则从当前工作目录逐级向上找 scripts/school_open_day_2026.py，
 // 找不到回落 os.Getwd()（此时 Run 会因脚本缺失打 WARN，不 panic）。
 // 注意：Go scheduler 在 cmd/server 内以工作目录启动（容器 WORKDIR /app），
 // 若进程以别的工作目录拉起（如 systemd/裸 binary），上溯穷尽后仍以
 // os.Getwd() 兜底，把缺失暴露成 WARN 而非静默。
 func repoRoot() string {
+	if root := strings.TrimSpace(os.Getenv("WB2A_ROOT")); root != "" {
+		if _, err := os.Stat(filepath.Join(root, "scripts", "school_open_day_2026.py")); err == nil {
+			return root
+		}
+	}
 	start, err := os.Getwd()
 	if err != nil {
 		return "."

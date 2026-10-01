@@ -228,6 +228,7 @@ func main() {
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		CheckinOnStart:      cfg.Schedule.CheckinOnStart,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,

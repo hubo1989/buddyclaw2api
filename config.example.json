@@ -29,6 +29,7 @@
       1
     ],
     "checkin_enabled": true,
+    "checkin_on_start": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,

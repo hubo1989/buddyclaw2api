@@ -14,7 +14,7 @@
 - 🔄 **多账号轮转** — 三因子加权随机选号（credits ×闲置×成功率），防热点 + 防惊群（100ms 窗口）
 - 🛠 **工具调用** — 完整支持 OpenAI tools/tool_choice，流式 `tool_calls` 按 index 合并
 - 📡 **流式 + 非流式** — 上游 SSE 透传；非流式本地聚合（上游拒绝非流式请求）
-- ⏰ **定时签到** — 每日 09:00 / 21:00 自动签到 + 积分查询，积分耗尽账号次日 04:00 自动恢复
+- ⏰ **定时签到** — 启动幂等补签 + 每日 09:00 / 21:00 自动签到；WorkBuddy/AutoClaw 执行签到，Qoder 检查每日名额与活动状态
 - 🦞 **AutoClaw 上游（可选）** — `autoclaw/*` 模型前缀路由到智谱 AutoClaw 云端；手机验证码登录、独立 token 刷新（轮换写回）、每日签到（400 分/次，幂等）、积分钱包查询
 - 📊 **积分监控** — `credit.sh` 一键查询全部账号剩余/总量/百分比
 - 🔑 **登录工具** — `login.sh` 交互式登录，落盘即生效
@@ -308,10 +308,22 @@ go run ./cmd/server
 ./service.sh uninstall   # 停止并关闭开机自启
 ```
 
-- plist 写入 `~/Library/LaunchAgents/com.hubo.workbuddy2api.plist`，其中路径按仓库实际位置生成，可整目录搬迁后重跑 `install`。
+- plist 写入 `~/Library/LaunchAgents/com.hubo.workbuddy2api.plist`；服务二进制安装到 `~/Library/Application Support/workbuddy2api/wb2api`，避免外置卷影响 launchd。仓库迁移后重跑 `install`。
 - `RunAtLoad` + `KeepAlive`：登录即启动、崩溃自动拉起；`ThrottleInterval=10` 避免配置错误时打爆日志。
+- 网关常驻后，OpenCodeX 的 Qoder/AutoClaw 本地代理与每日签到排程均可依赖 7863 端口；启动补签由 `schedule.checkin_on_start` 控制（默认开启）。
+
+### OpenCodeX 账号每日签到
+
+`./service.sh install` 会额外注册 `com.hubo.workbuddy2api.opencodex-checkin`：
+
+- 每 300 秒触发一次；任务先检查 `~/.opencodex/runtime-port.json` 里的 OpenCodeX PID，OpenCodeX 未运行时直接跳过。
+- 按自然日去重，OpenCodeX 启动或账号补录后 5 分钟内会补跑当日任务。
+- WorkBuddy CN：遍历 OpenCodeX `workbuddy` 账号池执行幂等签到；token 需要刷新时以 access token 作为 CAS 写回 `~/.opencodex/auth.json`。
+- Qoder：遍历 global/CN 账号读取活动与每日名额状态；当前公开协议没有领取写接口，每日 add-on 由服务端发放。
+- AutoClaw：任务接口只接受手机验证码登录的 `agent*_token`。OpenCodeX 网页 OAuth 的 `autoclaw*_token` 可用于聊天，但调用签到会 401；这些账号会记录“当日已处理/跳过”。如需 AutoClaw 自动签到，请用 `wb2api-autoclaw-login` 为网关添加服务独占手机号账号。
+- 日志：`~/Library/Logs/workbuddy2api/opencodex-checkin.{out,err}.log`。
 - 环境变量写死 `WB2A_LISTEN=127.0.0.1:7863` —— **即使 `config.json` 里写了 `:7863`，也会被 env 覆盖回回环**，不会因改配置意外暴露到全网卡。
-- 日志落在 `logs/wb2api.{out,err}.log`（已 gitignore）。
+- 日志落在 `~/Library/Logs/workbuddy2api/wb2api.{out,err}.log`（已 gitignore）。
 
 > 本机自用走"回环 + 不设 key"，所以 `install` 不需要任何密钥。若你的终端被本工具之外的环境限制（无法写 launchd 域），`install` 会明确提示手动执行的那一条命令；plist 本身放在 `~/Library/LaunchAgents/` 下，**下一次登录也会自动加载**。
 
