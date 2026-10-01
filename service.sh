@@ -37,7 +37,10 @@ source "$ROOT/scripts/goenv.sh"
 
 build_bin() {
     # force=1 时即使二进制存在也重建，避免代码更新后 launchd 继续跑旧版本。
+    # APP_DIR 必须先建：首次安装时 go build 的 -o 目标位于该目录。
     local force="${1:-0}"
+    mkdir -p "$APP_DIR" "$LOG_DIR"
+    chmod 700 "$APP_DIR" "$LOG_DIR"
     if [[ "$force" == "1" || ! -x "$BIN" ]]; then
         say "构建二进制 $BIN ..."
         require_go || exit 1
@@ -49,18 +52,97 @@ build_bin() {
 
 
 # 安装运行时快照到内置卷：macOS launchd 进程访问外置卷文件可能在 open() 卡住。
-# 首次安装复制账号；之后 7863 管理登录产生的账号以内置卷为准，不反向覆盖。
+# 每次安装/重启同步 CLI 新账号，同时不回滚运行时刷新出的较新 token。
 install_runtime() {
-    mkdir -p "$APP_DIR/auths" "$APP_DIR/data" "$APP_DIR/scripts"
-    chmod 700 "$APP_DIR" "$APP_DIR/auths" "$APP_DIR/data"
-    cp -p "$ROOT/config.json" "$APP_DIR/config.json"
-    chmod 600 "$APP_DIR/config.json"
-    if ! ls "$APP_DIR"/auths/*.json >/dev/null 2>&1; then
-        for f in "$ROOT"/auths/*.json; do
-            [[ -f "$f" ]] && cp -p "$f" "$APP_DIR/auths/"
-        done
-    fi
-    [[ -f "$APP_DIR/data/state.json" ]] || cp -p "$ROOT/data/state.json" "$APP_DIR/data/state.json" 2>/dev/null || true
+    mkdir -p "$APP_DIR/auths" "$APP_DIR/data" "$APP_DIR/scripts" "$APP_DIR/config-assets"
+    chmod 700 "$APP_DIR" "$APP_DIR/auths" "$APP_DIR/data" "$APP_DIR/config-assets"
+
+    python3 - "$ROOT" "$APP_DIR" <<'PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+app = Path(sys.argv[2]).resolve()
+config = {}
+source_config = root / "config.json"
+if source_config.exists():
+    config = json.loads(source_config.read_text())
+assets = app / "config-assets"
+
+def copy_file(value):
+    source = (root / value).resolve()
+    if not source.is_file():
+        return value
+    try:
+        relative = str(source.relative_to(root))
+    except ValueError:
+        relative = str(source)
+    name = hashlib.sha256(relative.encode()).hexdigest()[:16] + (source.suffix or ".bin")
+    target = assets / name
+    shutil.copy2(source, target)
+    os.chmod(target, 0o600)
+    return str(target)
+
+def normalize(node):
+    if isinstance(node, dict):
+        out = {}
+        for key, value in node.items():
+            if isinstance(value, str) and value and not os.path.isabs(value):
+                if key == "auth_dir":
+                    source = (root / value).resolve()
+                    target = assets / ("auth-dir-" + hashlib.sha256(value.encode()).hexdigest()[:16])
+                    if source.is_dir():
+                        shutil.copytree(source, target, dirs_exist_ok=True)
+                        value = str(target)
+                elif key in {"file", "device_token_file"}:
+                    value = copy_file(value)
+            out[key] = normalize(value)
+        return out
+    if isinstance(node, list):
+        return [normalize(value) for value in node]
+    return node
+
+config = normalize(config)
+config.setdefault("auth_dir", str(app / "auths"))
+config.setdefault("autoclaw", {}).setdefault("auth_dir", str(app / "auths"))
+config.setdefault("qoder", {}).setdefault("auth_dir", str(app / "auths"))
+config.setdefault("state_file", str(app / "data" / "state.json"))
+target_config = app / "config.json"
+target_config.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
+os.chmod(target_config, 0o600)
+
+def expiry(data):
+    nested = data.get("auth", {}) if isinstance(data, dict) else {}
+    return int(nested.get("expiresAt", data.get("expiresAt", 0)) or 0)
+
+runtime = app / "auths"
+for source in (root / "auths").glob("*.json"):
+    if source.name.split("-", 1)[0] not in {"workbuddy", "autoclaw", "qoder"}:
+        continue
+    target = runtime / source.name
+    if not target.exists():
+        shutil.copy2(source, target)
+        os.chmod(target, 0o600)
+        continue
+    try:
+        before, after = json.loads(source.read_text()), json.loads(target.read_text())
+    except Exception:
+        continue
+    # CLI 新账号/重登文件只在 expiry 不旧于运行时快照时同步；运行时刷新的新 token 不被旧文件覆盖。
+    if source.stat().st_mtime > target.stat().st_mtime and expiry(before) >= expiry(after):
+        shutil.copy2(source, target)
+        os.chmod(target, 0o600)
+
+state = app / "data" / "state.json"
+source_state = root / "data" / "state.json"
+if not state.exists() and source_state.exists():
+    shutil.copy2(source_state, state)
+PY
+
     cp -R "$ROOT/scripts/." "$APP_DIR/scripts/"
 }
 
@@ -81,8 +163,10 @@ write_plist() {
         <string>${APP_DIR}/config.json</string>
     </array>
 
-    <!-- 不把外置仓库设为进程 cwd：macOS 27 launchd 下 Go runtime getcwd 可能卡住。
-         配置/auth/state 用绝对路径；scripts 通过 WB2A_ROOT 定位。 -->
+    <!-- macOS 27 launchd 访问外置卷 cwd/文件可能卡住；运行时快照和 cwd 都使用内置卷。 -->
+    <key>WorkingDirectory</key>
+    <string>${APP_DIR}</string>
+
     <key>EnvironmentVariables</key>
     <dict>
         <!-- 只绑回环：仅本机可达，启动闸门只告警不拦，故无需 api_key -->
@@ -222,6 +306,7 @@ do_restart() {
         say "❌ 服务未加载，先执行：./service.sh install"
         exit 1
     fi
+    install_runtime
     if launchctl kickstart -k "$SERVICE" 2>/dev/null; then
         say "✅ 已重启 ${LABEL}"
     else

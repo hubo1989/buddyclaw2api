@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sync"
 	"time"
 
@@ -332,10 +333,25 @@ func (s *Scheduler) runStartupCheckin() {
 	s.startupCheckin()
 }
 
+// nonNilProvider 同时排除 nil 接口和类型化 nil 指针，防止 disabled provider
+// 以 (*Subsystem)(nil) 形式进入接口后触发 nil receiver panic。
+func nonNilProvider(v any) bool {
+	if v == nil {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return !rv.IsNil()
+	default:
+		return true
+	}
+}
+
 // runProviderCheckins 输出 AutoClaw 签到与 Qoder 每日活动/名额观测结果。
 func (s *Scheduler) runProviderCheckins() {
 	// autoclaw 上游签到（幂等，含积分余额刷新）。
-	if s.cfg.Autoclaw != nil {
+	if nonNilProvider(s.cfg.Autoclaw) {
 		for _, r := range s.cfg.Autoclaw.RunSignin() {
 			switch {
 			case r.Skipped:
@@ -351,7 +367,7 @@ func (s *Scheduler) runProviderCheckins() {
 	}
 	// qoder 每日活动/名额观测：当前公开协议没有领取写接口；名额 add-on 由服务端
 	// 按日发放，这里在签到槽位输出名额状态，claimable 活动则提醒人工领取。
-	if s.cfg.Qoder != nil {
+	if nonNilProvider(s.cfg.Qoder) {
 		for _, r := range s.cfg.Qoder.RunCampaignCheck() {
 			switch {
 			case r.Err != "":

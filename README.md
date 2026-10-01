@@ -318,7 +318,7 @@ go run ./cmd/server
 
 - 每 300 秒触发一次；任务先检查 `~/.opencodex/runtime-port.json` 里的 OpenCodeX PID，OpenCodeX 未运行时直接跳过。
 - 按自然日去重，OpenCodeX 启动或账号补录后 5 分钟内会补跑当日任务。
-- WorkBuddy CN：遍历 OpenCodeX `workbuddy` 账号池执行幂等签到；token 需要刷新时以 access token 作为 CAS 写回 `~/.opencodex/auth.json`。
+- WorkBuddy CN：遍历 OpenCodeX `workbuddy` 账号池执行幂等签到；token 需要刷新时使用 OpenCodeX 的 `auth.store.lock` 协议重读当前文件，并在 access token 未并发变化时写回 `~/.opencodex/auth.json`。
 - Qoder：遍历 global/CN 账号读取活动与每日名额状态；当前公开协议没有领取写接口，每日 add-on 由服务端发放。
 - AutoClaw：任务接口只接受手机验证码登录的 `agent*_token`。OpenCodeX 网页 OAuth 的 `autoclaw*_token` 可用于聊天，但调用签到会 401；这些账号会记录“当日已处理/跳过”。如需 AutoClaw 自动签到，请用 `wb2api-autoclaw-login` 为网关添加服务独占手机号账号。
 - 日志：`~/Library/Logs/workbuddy2api/opencodex-checkin.{out,err}.log`。

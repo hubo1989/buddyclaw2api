@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestDailyState(t *testing.T) {
@@ -36,8 +38,8 @@ func TestSaveAuthUpdatesUsesAccessCAS(t *testing.T) {
 	err := saveAuthUpdates(path, []tokenUpdate{{
 		provider: "autoclaw", id: "a", oldAccess: "changed", access: "new", refresh: "new-refresh", expiresMs: 2,
 	}})
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("stale CAS must return an error")
 	}
 	var s authStore
 	if err := json.Unmarshal(read(t, path), &s); err != nil {
@@ -62,6 +64,37 @@ func TestSaveAuthUpdatesUsesAccessCAS(t *testing.T) {
 	}
 	if stringField(c, "email") != "u" {
 		t.Fatalf("unknown credential metadata must be preserved: %#v", c)
+	}
+}
+
+func TestAuthStoreLockCooperativeHandoff(t *testing.T) {
+	dir := t.TempDir()
+	first, err := acquireAuthStoreLock(filepath.Join(dir, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan *authStoreLock, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		lock, err := acquireAuthStoreLock(filepath.Join(dir, "auth.json"))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		second <- lock
+	}()
+	time.Sleep(20 * time.Millisecond)
+	first.release()
+	select {
+	case lock := <-second:
+		lock.release()
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("lock was not handed off after release")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auth.store.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released lock still exists: %v", err)
 	}
 }
 

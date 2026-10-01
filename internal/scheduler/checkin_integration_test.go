@@ -65,3 +65,20 @@ func TestStartupCheckinGate(t *testing.T) {
 		t.Fatalf("checkin disabled must not run startup checkin, calls=%d", calls.Load())
 	}
 }
+
+type nilAutoclawCheckin struct{}
+
+func (*nilAutoclawCheckin) RunSignin() []autoclaw.SigninResult {
+	panic("typed-nil provider must not be dispatched")
+}
+
+// TestRunCheckinNowSkipsTypedNilProviders 回归：接口内类型化 nil 指针本身非 nil，
+// disabled provider 不能触发其方法。
+func TestRunCheckinNowSkipsTypedNilProviders(t *testing.T) {
+	s := New(Config{
+		Pool:     pool.New(""),
+		Upstream: &upstream.Client{},
+		Autoclaw: (*nilAutoclawCheckin)(nil),
+	})
+	s.RunCheckinNow() // 未 panic 即通过。
+}

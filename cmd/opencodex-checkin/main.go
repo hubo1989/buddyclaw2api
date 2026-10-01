@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -74,18 +75,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
+	if *force {
+		state.Accounts = map[string]string{}
+	}
 	day := time.Now().In(time.Local).Format("2006-01-02")
-	var updates []tokenUpdate
 	fail := 0
-	fail += runWorkbuddy(store, state, day, &updates)
-	fail += runAutoclaw(store, state, day, &updates)
+	fail += runWorkbuddy(store, state, day, *authPath)
+	fail += runAutoclaw(store, state, day, *authPath)
 	fail += runQoder(store, state, day)
 	if err := saveState(*statePath, state); err != nil {
 		log.Printf("WARN: save state: %v", err)
-		fail++
-	}
-	if err := saveAuthUpdates(*authPath, updates); err != nil {
-		log.Printf("WARN: save auth: %v", err)
 		fail++
 	}
 	if fail != 0 {
@@ -143,7 +142,7 @@ func mark(state *runState, provider, id, day string) {
 	state.Accounts[provider+"/"+id] = day
 }
 
-func runWorkbuddy(store authStore, state *runState, day string, updates *[]tokenUpdate) int {
+func runWorkbuddy(store authStore, state *runState, day, authPath string) int {
 	fail := 0
 	for _, provider := range []string{"workbuddy", "workbuddy-global"} {
 		for _, row := range store[provider].Accounts {
@@ -155,7 +154,7 @@ func runWorkbuddy(store authStore, state *runState, day string, updates *[]token
 				mark(state, provider, row.ID, day)
 				continue
 			}
-			if err := workbuddyCheckin(provider, row, updates); err != nil {
+			if err := workbuddyCheckin(provider, row, authPath); err != nil {
 				log.Printf("workbuddy/%s: %v", row.ID, err)
 				fail++
 				continue
@@ -166,7 +165,7 @@ func runWorkbuddy(store authStore, state *runState, day string, updates *[]token
 	return fail
 }
 
-func workbuddyCheckin(provider string, row accountRow, updates *[]tokenUpdate) error {
+func workbuddyCheckin(provider string, row accountRow, authPath string) error {
 	access := stringField(row.Credential, "access")
 	refresh := stringField(row.Credential, "refresh")
 	uid := stringField(row.Credential, "accountId")
@@ -190,11 +189,13 @@ func workbuddyCheckin(provider string, row accountRow, updates *[]tokenUpdate) e
 		if err := client.RefreshToken(a); err != nil {
 			return fmt.Errorf("refresh: %w", err)
 		}
-		*updates = append(*updates, tokenUpdate{
+		if err := saveAuthUpdates(authPath, []tokenUpdate{{
 			provider: provider, id: row.ID, oldAccess: access,
 			access: a.AccessToken, refresh: a.RefreshToken,
 			expiresMs: a.ExpiresAt * 1000,
-		})
+		}}); err != nil {
+			return fmt.Errorf("save refreshed credential: %w", err)
+		}
 	}
 	if err := client.DailyCheckin(a); err != nil {
 		if upstream.IsAlreadyCheckin(err) {
@@ -207,7 +208,7 @@ func workbuddyCheckin(provider string, row accountRow, updates *[]tokenUpdate) e
 	return nil
 }
 
-func runAutoclaw(store authStore, state *runState, day string, updates *[]tokenUpdate) int {
+func runAutoclaw(store authStore, state *runState, day, authPath string) int {
 	fail := 0
 	ctx := context.Background()
 	for _, row := range store["autoclaw"].Accounts {
@@ -246,10 +247,14 @@ func runAutoclaw(store authStore, state *runState, day string, updates *[]tokenU
 			if nextDevice := jwtStringClaim(cred.RefreshToken, "device_id"); nextDevice != "" {
 				cred.DeviceID = nextDevice
 			}
-			*updates = append(*updates, tokenUpdate{
+			if err := saveAuthUpdates(authPath, []tokenUpdate{{
 				provider: "autoclaw", id: row.ID, oldAccess: stringField(row.Credential, "access"),
 				access: cred.AccessToken, refresh: cred.RefreshToken, expiresMs: cred.ExpiresAt * 1000,
-			})
+			}}); err != nil {
+				log.Printf("autoclaw/%s: save refreshed credential: %v", row.ID, err)
+				fail++
+				continue
+			}
 		}
 		res, err := client.ForCred(cred).TaskComplete(ctx, cred.AccessToken, cred.DeviceID)
 		if err != nil {
@@ -282,15 +287,16 @@ func runQoder(store authStore, state *runState, day string) int {
 			}
 			client := qoder.NewClient()
 			camp, err := client.Campaigns(realm, tok)
+			var limited *qoder.LimitedNumberResult
 			if err == nil {
-				_, err = client.LimitedNumber(realm, tok)
+				limited, err = client.LimitedNumber(realm, tok)
 			}
 			if err != nil {
 				log.Printf("%s/%s: %v", provider, row.ID, err)
 				fail++
 				continue
 			}
-			log.Printf("%s/%s: campaigns=%d claimable=%v", provider, row.ID, len(camp.Campaigns), camp.Claimable)
+			log.Printf("%s/%s: campaigns=%d claimable=%v limited=%v number=%d createdAt=%s", provider, row.ID, len(camp.Campaigns), camp.Claimable, limited.HasNumber, limited.Number, limited.CreatedAt)
 			mark(state, provider, row.ID, day)
 		}
 	}
@@ -301,6 +307,15 @@ func saveAuthUpdates(path string, updates []tokenUpdate) error {
 	if len(updates) == 0 {
 		return nil
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	lock, err := acquireAuthStoreLock(path)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -309,11 +324,16 @@ func saveAuthUpdates(path string, updates []tokenUpdate) error {
 	if err := json.Unmarshal(raw, &current); err != nil {
 		return err
 	}
+	var conflict error
 	for _, u := range updates {
 		set := current[u.provider]
 		for i := range set.Accounts {
 			row := &set.Accounts[i]
-			if row.ID != u.id || stringField(row.Credential, "access") != u.oldAccess {
+			if row.ID != u.id {
+				continue
+			}
+			if stringField(row.Credential, "access") != u.oldAccess {
+				conflict = fmt.Errorf("credential changed concurrently: %s/%s", u.provider, u.id)
 				continue
 			}
 			row.Credential["access"] = u.access
@@ -322,7 +342,93 @@ func saveAuthUpdates(path string, updates []tokenUpdate) error {
 		}
 		current[u.provider] = set
 	}
-	return atomicWrite(path, current)
+	if err := atomicWrite(path, current); err != nil {
+		return err
+	}
+	return conflict
+}
+
+// acquireAuthStoreLock implements the same cooperative auth.store.lock protocol as
+// OpenCodeX. OpenCodeX mutations hold this lock while loading, changing, and renaming
+// auth.json, so refreshing under it prevents a stale whole-store replacement.
+func acquireAuthStoreLock(authPath string) (*authStoreLock, error) {
+	lockPath := filepath.Join(filepath.Dir(authPath), "auth.store.lock")
+	deadline := time.Now().Add(5 * time.Second)
+	owner := randomOwner()
+	for {
+		fd, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			meta := map[string]any{"version": 1, "ownerId": owner, "pid": os.Getpid(), "createdAt": time.Now().UnixMilli()}
+			raw, _ := json.Marshal(meta)
+			raw = append(raw, '\n')
+			if _, err := fd.Write(raw); err != nil {
+				_ = fd.Close()
+				return nil, err
+			}
+			if err := fd.Close(); err != nil {
+				return nil, err
+			}
+			return &authStoreLock{path: lockPath, owner: owner}, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		raw, statErr := os.ReadFile(lockPath)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			return nil, statErr
+		}
+		var meta struct {
+			OwnerID   string `json:"ownerId"`
+			CreatedAt int64  `json:"createdAt"`
+		}
+		if json.Unmarshal(raw, &meta) != nil || meta.CreatedAt <= 0 {
+			meta.CreatedAt = time.Now().Add(-time.Hour).UnixMilli()
+		}
+		if time.Since(time.UnixMilli(meta.CreatedAt)) > 30*time.Second && removeUnchangedLock(lockPath, raw) {
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for %s", lockPath)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+type authStoreLock struct {
+	path, owner string
+}
+
+func (l *authStoreLock) release() {
+	raw, err := os.ReadFile(l.path)
+	if err != nil {
+		return
+	}
+	var meta struct {
+		OwnerID string `json:"ownerId"`
+	}
+	if json.Unmarshal(raw, &meta) != nil || meta.OwnerID != l.owner {
+		return
+	}
+	_ = os.Remove(l.path)
+}
+
+func removeUnchangedLock(path string, expected []byte) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != string(expected) {
+		return false
+	}
+	return os.Remove(path) == nil
+}
+
+func randomOwner() string {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Sprintf("fallback-%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(raw)
 }
 
 func atomicWrite(path string, v any) error {
