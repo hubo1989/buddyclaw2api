@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sync"
 	"time"
 
@@ -30,9 +31,11 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	// Autoclaw 可选上游（nil = 未启用）：签到任务对其账号同样生效。
-	Autoclaw *autoclaw.Subsystem
-	// Qoder 可选上游（nil = 未启用）：每日活动观测（无签到机制，仅可领取提醒）。
-	Qoder       *qoder.Subsystem
+	// 使用窄接口便于测试与后续替换具体 subsystem。
+	Autoclaw AutoclawSigninRunner
+	// Qoder 可选上游（nil = 未启用）：每日活动/名额观测。当前上游没有公开
+	// 领取写接口；名额持有者的每日 add-on 由服务端发放，这里读取状态与配额入口。
+	Qoder       QoderCampaignRunner
 	SchoolHours []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours    []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
@@ -47,6 +50,8 @@ type Config struct {
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
 	CheckinDisabled bool
+	// CheckinOnStart 启动补签，覆盖 OpenCodeX/网关晚于当日槽位启动的场景。
+	CheckinOnStart bool
 	// TravelDisabled 显式关闭猫猫旅行排程（schedule.travel_enabled=false）。
 	TravelDisabled bool
 	// ActivityDisabled 显式关闭活跃上报排程（schedule.activity_enabled=false）。
@@ -76,6 +81,19 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// startupCheckin 仅为 Run 启动补签保留可替换入口；生产由 New 绑定 RunCheckinNow。
+	startupCheckin func()
+}
+
+// AutoclawSigninRunner AutoClaw 每日签到依赖。
+type AutoclawSigninRunner interface {
+	RunSignin() []autoclaw.SigninResult
+}
+
+// QoderCampaignRunner Qoder 每日活动/名额观测依赖。
+type QoderCampaignRunner interface {
+	RunCampaignCheck() []qoder.CampaignCheck
 }
 
 // New 构建。
@@ -102,7 +120,9 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
+	s := &Scheduler{cfg: cfg, adoptTried: map[string]string{}, rewardClaimed: map[string]string{}}
+	s.startupCheckin = s.RunCheckinNow
+	return s
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -231,6 +251,7 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	s.runStartupCheckin()
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -294,10 +315,76 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 	}
 }
 
-// RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
+// RunCheckinNow 定时/启动触发的立即签到：WorkBuddy、AutoClaw 与 Qoder 观测统一挂在
+// checkin_hours 语义下；逐账号结果由各子系统记日志，此处只兜住"撞车跳过"。
 func (s *Scheduler) RunCheckinNow() {
 	if _, err := s.CheckinAll(); err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
+	}
+	s.runProviderCheckins()
+}
+
+// runStartupCheckin 启动补签。上游签到幂等，服务重启后重复调用只会得到"已签到"。
+func (s *Scheduler) runStartupCheckin() {
+	if s.cfg.CheckinDisabled || !s.cfg.CheckinOnStart {
+		return
+	}
+	log.Printf("startup checkin: running idempotent daily checkin")
+	s.startupCheckin()
+}
+
+// nonNilProvider 同时排除 nil 接口和类型化 nil 指针，防止 disabled provider
+// 以 (*Subsystem)(nil) 形式进入接口后触发 nil receiver panic。
+func nonNilProvider(v any) bool {
+	if v == nil {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return !rv.IsNil()
+	default:
+		return true
+	}
+}
+
+// runProviderCheckins 输出 AutoClaw 签到与 Qoder 每日活动/名额观测结果。
+func (s *Scheduler) runProviderCheckins() {
+	// autoclaw 上游签到（幂等，含积分余额刷新）。
+	if nonNilProvider(s.cfg.Autoclaw) {
+		for _, r := range s.cfg.Autoclaw.RunSignin() {
+			switch {
+			case r.Skipped:
+				log.Printf("autoclaw checkin %s: skipped (%s)", r.Phone, r.Error)
+			case r.OK && r.Already:
+				log.Printf("autoclaw checkin %s: already signed (balance=%d)", r.Phone, r.Balance)
+			case r.OK:
+				log.Printf("autoclaw checkin %s: +%d points (balance=%d)", r.Phone, r.Reward, r.Balance)
+			default:
+				log.Printf("autoclaw checkin %s: %s", r.Phone, r.Error)
+			}
+		}
+	}
+	// qoder 每日活动/名额观测：当前公开协议没有领取写接口；名额 add-on 由服务端
+	// 按日发放，这里在签到槽位输出名额状态，claimable 活动则提醒人工领取。
+	if nonNilProvider(s.cfg.Qoder) {
+		for _, r := range s.cfg.Qoder.RunCampaignCheck() {
+			switch {
+			case r.Err != "":
+				log.Printf("qoder campaign %s/%s: %s", r.Realm, r.UserID, r.Err)
+			case r.Claimable:
+				log.Printf("NOTICE: qoder campaign %s/%s 有可领取活动 (%d 项) %s —— 请到 qoder.com/qoder.cn 领取", r.Realm, r.UserID, r.Count, r.CampaignURL)
+			default:
+				log.Printf("qoder campaign %s/%s: 无活动", r.Realm, r.UserID)
+			}
+			if r.Err == "" {
+				if r.HasNumber {
+					log.Printf("qoder claim %s/%s: 名额有效 #%d（%s）—— 每日 Credits 附加包已按服务端状态发放", r.Realm, r.UserID, r.Number, r.NumberAt)
+				} else {
+					log.Printf("WARN: qoder claim %s/%s: 今日名额未持有 —— 请打开 Qoder 客户端领取", r.Realm, r.UserID)
+				}
+			}
+		}
 	}
 }
 
@@ -486,41 +573,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
 		s.claimGrowthRewards(a)  // 连登奖励 + 抽奖：点亮连登后按天领取（finally 语义：失败不拖累上报）
 	}
-	// autoclaw 上游签到（幂等，含积分余额刷新）。
-	if s.cfg.Autoclaw != nil {
-		for _, r := range s.cfg.Autoclaw.RunSignin() {
-			switch {
-			case r.Skipped:
-				log.Printf("autoclaw checkin %s: skipped (%s)", r.Phone, r.Error)
-			case r.OK && r.Already:
-				log.Printf("autoclaw checkin %s: already signed (balance=%d)", r.Phone, r.Balance)
-			case r.OK:
-				log.Printf("autoclaw checkin %s: +%d points (balance=%d)", r.Phone, r.Reward, r.Balance)
-			default:
-				log.Printf("autoclaw checkin %s: %s", r.Phone, r.Error)
-			}
-		}
-	}
-	// qoder 活动观测（无签到机制：claimable=true 时日志提醒人工领取）。
-	if s.cfg.Qoder != nil {
-		for _, r := range s.cfg.Qoder.RunCampaignCheck() {
-			switch {
-			case r.Err != "":
-				log.Printf("qoder campaign %s/%s: %s", r.Realm, r.UserID, r.Err)
-			case r.Claimable:
-				log.Printf("NOTICE: qoder campaign %s/%s 有可领取活动 (%d 项) %s —— 请到 qoder.com/qoder.cn 领取", r.Realm, r.UserID, r.Count, r.CampaignURL)
-			default:
-				log.Printf("qoder campaign %s/%s: 无活动", r.Realm, r.UserID)
-			}
-			if r.Err == "" {
-				if r.HasNumber {
-					log.Printf("qoder claim %s/%s: 名额有效 #%d（%s）—— 每日 Credits 附加包 +100", r.Realm, r.UserID, r.Number, r.NumberAt)
-				} else {
-					log.Printf("WARN: qoder claim %s/%s: 今日名额未持有 —— 请打开 Qoder 客户端领取", r.Realm, r.UserID)
-				}
-			}
-		}
-	}
+	// AutoClaw/Qoder 已归入签到任务，不再挂在活跃上报末尾。
 }
 
 // checkActivityStreak 上报成功后回读连登天数（只读 oracle，发现静默失败）。

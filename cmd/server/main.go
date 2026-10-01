@@ -216,6 +216,16 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	up.GlobalEnabled = cfg.Global.Enabled
 
+	// 不把类型化 nil 指针放进接口：disabled provider 必须保持接口本身为 nil，
+	// 避免 scheduler 启动补签进入非 nil 接口分支。
+	var autoclawCheckins scheduler.AutoclawSigninRunner
+	if acSub != nil {
+		autoclawCheckins = acSub
+	}
+	var qoderCampaigns scheduler.QoderCampaignRunner
+	if qSub != nil {
+		qoderCampaigns = qSub
+	}
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
@@ -228,13 +238,14 @@ func main() {
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		CheckinOnStart:      cfg.Schedule.CheckinOnStart,
 		TravelDisabled:      !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		CatDisabled:         !cfg.Schedule.CatEnabled,
-		Autoclaw:            acSub,
-		Qoder:               qSub,
+		Autoclaw:            autoclawCheckins,
+		Qoder:               qoderCampaigns,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:

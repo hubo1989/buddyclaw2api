@@ -201,3 +201,16 @@ func TestPythonCmd(t *testing.T) {
 		t.Errorf("trim pythonCmd()=%q want /usr/bin/python3.10", got)
 	}
 }
+
+// TestRepoRootEnvOverride LaunchAgent 可运行在内置卷、仓库仍在外置卷：
+// WB2A_ROOT 显式提供脚本根，避免依赖进程 cwd。
+func TestRepoRootEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_ROOT", "../..")
+	root, err := filepath.Abs(repoRoot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "scripts", "school_open_day_2026.py")); err != nil {
+		t.Fatalf("repo root %q has no scripts: %v", root, err)
+	}
+}
